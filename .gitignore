@@ -28,10 +28,8 @@ venv/
 ENV/
 
 # Project specific ignores
-models/
-caches/
-logs/
 data/
+caches/
 
 # IDEs and editors
 .idea/
