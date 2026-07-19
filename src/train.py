@@ -2,7 +2,7 @@
 V9 PPO 학습 (V9 Design.md 7장, 9장)
 
 - SubprocVecEnv 워커를 심볼별 배분 (예: 8워커 = BTC 4 + ETH 4)
-- 학습 데이터: 시계열 70% train 구간, 랜덤 시작 30일 에피소드
+- 학습 데이터: 시계열 70% train 구간, 랜덤 시작 60일 에피소드 (2026-07-19: 30일→60일)
 - 검증 콜백: eval_freq마다 검증셋(15%) 전체 결정론적 롤아웃 →
   거래수/승률/PnL/MSL/std/V8 Score를 TensorBoard 기록,
   심볼별 V8 Score 중 낮은 쪽이 최고인 체크포인트를 best로 저장 (모델 선택은 V8 Score 전용)
@@ -73,7 +73,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
 from env import TradingEnvV9  # noqa: E402
-from eval import cache_path_for, split_bounds, run_policy_on_range, compute_metrics  # noqa: E402
+from eval import cache_path_for, split_bounds, run_policy_on_range, compute_metrics, compound_metrics  # noqa: E402
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 MODEL_DIR = os.path.join(ROOT_DIR, "models")
@@ -214,6 +214,11 @@ def build_callbacks(args, cache_paths, bounds, run_name, env_kwargs):
                             "max_single_loss", "pnl_std", "v9_score",
                             "near_liq_n", "near_liq_pct"):
                     self.logger.record(f"valid/{sym}/{key}", m[key])
+                # 복리(전액 재투입) 지표 — 실전 운용 방식 기준 참고용 기록 (2026-07-19 추가).
+                # 모델 선택에는 미사용 (선택 기준은 v9_score 4분할 평균−표준편차 그대로).
+                cm = compound_metrics(trades, int(ts[lo]), int(ts[hi - 1]))
+                self.logger.record(f"valid/{sym}/compound_multiple", cm["multiple"])
+                self.logger.record(f"valid/{sym}/compound_mdd_pct", cm["mdd_pct"])
                 if sym == "BTC-USDT-SWAP":
                     # 2026-07-19: 검증 구간을 시간순 4등분해 각각 채점 — "특정 레짐에서만 버는"
                     # 체크포인트가 1년 합계로 위장하는 것을 걸러내기 위함 (검증 +1,412 → 테스트
@@ -278,7 +283,7 @@ def main():
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--stride", type=int, default=1)
-    parser.add_argument("--episode-days", type=int, default=30)
+    parser.add_argument("--episode-days", type=int, default=60)
     parser.add_argument("--eval-freq", type=int, default=500_000)
     parser.add_argument("--eval-segments", type=int, default=1)  # 2026-07-19: 세그먼트 분할 폐기 (경계 오차)
     parser.add_argument("--checkpoint-freq", type=int, default=1_000_000)
@@ -363,6 +368,7 @@ def main():
         vf_coef=0.5,
         policy_kwargs={"net_arch": [64, 64]},
         seed=args.seed,
+        device="cpu",              # CPU 강제 사용 (GPU 미활용 설정)
         verbose=1,
         tensorboard_log=LOG_DIR,
     )

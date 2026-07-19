@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
-from env import TradingEnvV9  # noqa: E402
+from env import TradingEnvV9, MARGIN_USDT  # noqa: E402
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 CACHE_DIR = os.path.join(ROOT_DIR, "caches")
@@ -158,6 +158,43 @@ def compute_metrics(trades, ts_lo_ms, ts_hi_ms):
     }
 
 
+def compound_metrics(trades, ts_lo_ms, ts_hi_ms, start_equity=100.0):
+    """복리 운용 시뮬레이션 (2026-07-19 추가, 평가 전용 — 학습 env/보상은 고정 100 USDT 유지).
+
+    실전 운용 방식(시작 자본 100 USDT, 매 거래 전재산을 증거금으로 투입) 기준의 성장률.
+    별도 재시뮬레이션 없이 고정 사이징 거래 목록에서 정확히 재구성 가능한 근거:
+      - 손익/수수료가 증거금에 선형 비례 (pos_size = 증거금×lev/price) → 거래 수익률
+        r = pnl/100은 증거금 규모 불변. 레버리지 상한(MAX_TRADE_LOSS_PCT)도 % 기준이라 동일.
+      - semi-MDP라 심볼 내 거래는 겹치지 않음(청산까지 fast-forward) → 순차 재투자 가정이
+        정확히 성립. (심볼 간에는 겹칠 수 있으므로 복리 지표는 심볼별로만 산출한다.)
+    equity ≤ 0(파산)은 현행 adaptive에선 거래당 손실 ≤ 20%라 불가능하지만 rule/rl 모드
+    (-100 가능) 방어용으로 처리한다.
+    """
+    months = max((ts_hi_ms - ts_lo_ms) / (30.44 * 86400 * 1000), 1e-9)
+    equity = start_equity
+    peak = start_equity
+    mdd_pct = 0.0
+    bankrupt = False
+    for t in sorted(trades, key=lambda t: t["entry_ts"]):
+        equity *= 1.0 + t["pnl"] / MARGIN_USDT
+        if equity <= 0.0:
+            equity = 0.0
+            bankrupt = True
+            break
+        peak = max(peak, equity)
+        mdd_pct = max(mdd_pct, (1.0 - equity / peak) * 100.0)
+    multiple = equity / start_equity
+    return {
+        "start_equity": start_equity,
+        "final_equity": float(equity),
+        "multiple": float(multiple),                # 최종자본 / 시작자본
+        "monthly_growth": float(multiple ** (1.0 / months)) if multiple > 0 else 0.0,  # 월평균 성장 배수
+        "mdd_pct": float(mdd_pct),                  # 복리 자본곡선 고점 대비 최대 낙폭 %
+        "bankrupt": bankrupt,
+        "months": months,
+    }
+
+
 def yearly_breakdown(trades):
     by_year = defaultdict(lambda: {"pnl": 0.0, "trades": 0})
     for t in trades:
@@ -193,6 +230,14 @@ def fmt_metrics(m):
     )
 
 
+def fmt_compound(cm):
+    status = "  ⚠️ BANKRUPT" if cm["bankrupt"] else ""
+    return (
+        f"  [복리 100 USDT 전액재투입] final={cm['final_equity']:,.1f}  x{cm['multiple']:.2f}"
+        f"  monthly=x{cm['monthly_growth']:.4f}  MDD={cm['mdd_pct']:.1f}%{status}"
+    )
+
+
 def evaluate(model, symbols, split, fee_rate=0.0005, decision_stride=1,
              n_segments=1, cache_suffix="", baseline_score=None, verbose=True,
              exit_mode="rule", sl_multiplier=None, tp_half_level=None,
@@ -213,14 +258,16 @@ def evaluate(model, symbols, split, fee_rate=0.0005, decision_stride=1,
                                      tp_half_level=tp_half_level, be_trigger_level=be_trigger_level,
                                      max_hold_bars=max_hold_bars)
         m = compute_metrics(trades, int(ts[lo]), int(ts[hi - 1]))
+        cm = compound_metrics(trades, int(ts[lo]), int(ts[hi - 1]))
         acc = acceptance(m, trades, baseline_score)
         report["symbols"][sym] = {
-            "metrics": m, "acceptance": acc, "yearly": yearly_breakdown(trades),
+            "metrics": m, "compound": cm, "acceptance": acc, "yearly": yearly_breakdown(trades),
         }
         all_trades.extend(trades)
         if verbose:
             print(f"\n=== [{sym}] {split} ===")
             print(fmt_metrics(m))
+            print(fmt_compound(cm))
             print(f"  acceptance: {acc}")
             print(f"  yearly: { {y: round(v['pnl'], 1) for y, v in yearly_breakdown(trades).items()} }")
 

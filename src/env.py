@@ -324,7 +324,7 @@ class TradingEnvV9(gym.Env):
         cache_path,
         start_idx=None,
         end_idx=None,
-        episode_len_rows=43200,      # 30일
+        episode_len_rows=86400,      # 60일 (2026-07-19: 30일→60일 확대)
         decision_stride=1,
         leverage=20.0,
         fee_rate=0.0005,
