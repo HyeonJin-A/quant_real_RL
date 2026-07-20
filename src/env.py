@@ -29,8 +29,8 @@ V9 트레이딩 환경 (V9 Design.md 5~6장, 9장)
   하나 = 완결된 보상인 semi-MDP 구조를 유지하므로(포지션 보유 중 추가 판단 없음) "rl"
   모드의 credit assignment 붕괴를 재도입하지 않는다. 청산은 반익절(50%, tp_half_level,
   a[5]>0일 때만 실행 — 2026-07-19 선택제로 변경) → 완익절(전량, tp_full_level,
-  tp_half_level 이상으로 강제) → 고정 손절(sl_multiplier, 진입 후 불변) → 30일
-  타임아웃 순으로 판정한다.
+  tp_half_level 이상으로 강제) → 고정 손절(sl_multiplier, 진입 후 불변) → 7일
+  타임아웃(DEFAULT_MAX_HOLD_BARS) 순으로 판정한다.
 
 - 2026-07-18 (adaptive 모드 보강): 레버리지 상한을 "종목별 고정값"이 아니라 그 순간의
   ATR%에만 반응하는 dynamic_leverage_ceiling()으로 동적 제한한다 (V9 Issue -
@@ -50,10 +50,13 @@ from gymnasium import spaces
 from numba import njit
 
 MARGIN_USDT = 100.0
-OBS_DIM = 14      # 파동/시장 피처 (다이버전스 발생 플래그 포함, wave_age_min 중복 제거).
+OBS_DIM = 18      # 파동/시장 피처 (다이버전스 발생 플래그 포함, wave_age_min 중복 제거).
                   # 2026-07-19: 포지션 상태 4칸 제거 — rule/adaptive는 semi-MDP라 결정 시점에
                   # 항상 무포지션이어서 영원히 0인 죽은 차원이었음. "rl" 모드 전용으로만 유지.
-RL_OBS_DIM = 18   # 구 "rl" 모드(보유 중 매 스텝 결정) 전용: 파동/시장 14 + 포지션 상태 4
+                  # 2026-07-20: 타이밍 피처 4종 추가(14→18) — 현재 RSI(방향조정) + 트레일링
+                  # 수익률 3지평(5m/15m/1h, ATR 정규화). 승률 천장 ~27%의 원인이 "되돌림이
+                  # 이미 시작됐는지 판정할 정보 부재"(칼손절 즉사 분석)라는 진단에 따름.
+RL_OBS_DIM = 22   # 구 "rl" 모드(보유 중 매 스텝 결정) 전용: 파동/시장 18 + 포지션 상태 4
 ACT_HOLD, ACT_LONG, ACT_SHORT, ACT_CLOSE = 0, 1, 2, 3
 ACT_SKIP, ACT_ENTER = 0, 1
 
@@ -67,6 +70,12 @@ NORM = {
     "hold_log_max": np.log1p(43200.0),       # 분 (30일, rl 모드 포지션 보유시간 정규화 전용)
     "upnl_clip": (-1.5, 3.0),     # 미실현손익 / 100 USDT
     "liq_dist_max": 10.0,         # %
+    # 타이밍 피처: 수익률을 ATR%로 나눈 "몇 ATR만큼 움직였나" 단위의 클립 상한 (2026-07-20).
+    # 원시 %는 종목/레짐 간 변동성 차이로 비교 불가라 ATR 정규화 채택 — 조용한 장의 -0.3%와
+    # 폭발장의 -0.3%를 구분. 상수는 v9b 분포 리포트(BTC/ETH p1~p99 커버)로 검증 후 확정.
+    "ret5_atr_clip": 3.0,
+    "ret15_atr_clip": 6.0,
+    "ret1h_atr_clip": 12.0,
 }
 
 # rule 모드 청산 파라미터 기본값 (V8 Design.md 서치 스페이스 중간값 근사; leverage는 V8과 동일 고정)
@@ -83,6 +92,12 @@ LEVERAGE_RANGE = (1, 50)            # 정수 레버리지. 증거금은 100 USDT
                                      # 2026-07-17: 100→50 하향. best 체크포인트 실측 결과 근접청산(-95 이하)
                                      # 62건이 전부 레버리지 45배 이상, 89%가 정확히 100배였고 20배 이하는
                                      # 0건 — 상한을 50까지만 열어도 관측된 근접청산 사례를 모두 배제.
+                                     # 2026-07-20: 하한 1→3 시도 후 폐기(당일 복귀). 가설(레버리지=1 거래가
+                                     # 적자 그룹이니 하한을 올리면 개선)은 인과를 거꾸로 읽은 것이었음 —
+                                     # 레버리지=1은 정책의 "확신 약함" 자기평가 신호였고, 하한을 강제로
+                                     # 올리자 그 타점들이 확신은 그대로인 채 리스크만 커져 오히려 악화
+                                     # (0720-1712 런: 승률은 41~46%로 상승했지만 PnL 전 구간 적자,
+                                     # 복리 MDD 96~100%). 레버리지 자기평가 기능을 보존하기 위해 1로 복귀.
 SL_MULTIPLIER_RANGE = (0.0, 3.0)    # 2026-07-19: 하한 0.3→0.0. 손절 기준점이 진입가가 아니라 파동
                                      # 극점(end_price)이라 0.0도 "극점 재터치 시 칼손절"이라는 정합적
                                      # 선택임 — 즉사 아님. 나쁜 선택이면 정책이 스스로 회피하게 둔다.
@@ -324,7 +339,7 @@ class TradingEnvV9(gym.Env):
         cache_path,
         start_idx=None,
         end_idx=None,
-        episode_len_rows=86400,      # 60일 (2026-07-19: 30일→60일 확대)
+        episode_len_rows=43200,      # 30일 (2026-07-19 60일 확대 → 2026-07-20 복귀: 60일 런 붕괴 실측, train.py 독스트링 참고)
         decision_stride=1,
         leverage=20.0,
         fee_rate=0.0005,
@@ -438,8 +453,19 @@ class TradingEnvV9(gym.Env):
         d5 = np.clip(np.where(age_min >= 5, d5, 0.0), -1.0, 1.0)
         d15 = np.clip(np.where(age_min >= 15, d15, 0.0), -1.0, 1.0)
 
+        # --- 타이밍 피처 4종 (2026-07-20, v9b 캐시 필수) ---
+        # 현재 RSI: rsi_adj(다이버전스용 rsi_previous)와 동일한 방향조정 관례 —
+        # 파동 방향 기준 "과열 정도"로 통일해 롱/숏 대칭 학습
+        rsi_now_adj = np.where(is_bull > 0, data["rsi_now"], 100.0 - data["rsi_now"]) / 100.0
+        # 트레일링 수익률: %를 그 시점 ATR%로 나눈 "몇 ATR 움직임"으로 정규화 후 클립
+        atr_pct_raw = np.maximum(data["atr_5m"] / close * 100.0, 1e-4)
+        r5 = np.clip(data["ret_5m"] * 100.0 / atr_pct_raw, -NORM["ret5_atr_clip"], NORM["ret5_atr_clip"]) / NORM["ret5_atr_clip"]
+        r15 = np.clip(data["ret_15m"] * 100.0 / atr_pct_raw, -NORM["ret15_atr_clip"], NORM["ret15_atr_clip"]) / NORM["ret15_atr_clip"]
+        r1h = np.clip(data["ret_1h"] * 100.0 / atr_pct_raw, -NORM["ret1h_atr_clip"], NORM["ret1h_atr_clip"]) / NORM["ret1h_atr_clip"]
+
         return np.stack(
-            [ws, dur, has_div, rsi_adj, gap, vr, vs, adx, atr_pct, bull, fib, prehit, d5, d15],
+            [ws, dur, has_div, rsi_adj, gap, vr, vs, adx, atr_pct, bull, fib, prehit, d5, d15,
+             rsi_now_adj, r5, r15, r1h],
             axis=1,
         ).astype(np.float32)
 
@@ -449,19 +475,19 @@ class TradingEnvV9(gym.Env):
             # semi-MDP: 결정 시점엔 항상 플랫 → 파동/시장 14차원만 (포지션 상태 칸 제거, 2026-07-19)
             return self.static_obs[i].copy()
         obs = np.empty(RL_OBS_DIM, dtype=np.float32)
-        obs[:14] = self.static_obs[i]
+        obs[:OBS_DIM] = self.static_obs[i]
         if self.pos_dir == 0:
-            obs[14:] = 0.0
+            obs[OBS_DIM:] = 0.0
         else:
             close = self.closes[i]
             upnl = self._unrealized(close)
             lo_c, hi_c = NORM["upnl_clip"]
             hold_min = (self.ts_ms[i] - self.entry_ts) / 60000.0
             liq_dist = self.pos_dir * (close - self.liq_price) / close * 100.0
-            obs[14] = float(self.pos_dir)
-            obs[15] = float(np.clip(upnl / MARGIN_USDT, lo_c, hi_c))
-            obs[16] = float(np.log1p(max(hold_min, 0.0)) / NORM["hold_log_max"])
-            obs[17] = float(np.clip(liq_dist, 0.0, NORM["liq_dist_max"]) / NORM["liq_dist_max"])
+            obs[OBS_DIM] = float(self.pos_dir)
+            obs[OBS_DIM + 1] = float(np.clip(upnl / MARGIN_USDT, lo_c, hi_c))
+            obs[OBS_DIM + 2] = float(np.log1p(max(hold_min, 0.0)) / NORM["hold_log_max"])
+            obs[OBS_DIM + 3] = float(np.clip(liq_dist, 0.0, NORM["liq_dist_max"]) / NORM["liq_dist_max"])
         return obs
 
     # ---------- 포지션 회계 (rl 모드) ----------

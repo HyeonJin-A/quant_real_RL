@@ -2,10 +2,14 @@
 V9 PPO 학습 (V9 Design.md 7장, 9장)
 
 - SubprocVecEnv 워커를 심볼별 배분 (예: 8워커 = BTC 4 + ETH 4)
-- 학습 데이터: 시계열 70% train 구간, 랜덤 시작 60일 에피소드 (2026-07-19: 30일→60일)
+- 학습 데이터: 시계열 70% train 구간, 랜덤 시작 30일 에피소드
+  (2026-07-19 60일로 확대했다가 2026-07-20 30일 복귀 — 60일 런(0719 오전)이 칼손절
+  스캘핑 분지로 붕괴(승률 16%, PF 0.86)했고, 에피소드만 30일로 되돌린 0719-1459 런이
+  스윙형/승률 27%로 정상 복귀한 실측 근거. 업데이트당 레짐 다양성 감소가 유력 원인)
 - 검증 콜백: eval_freq마다 검증셋(15%) 전체 결정론적 롤아웃 →
-  거래수/승률/PnL/MSL/std/V8 Score를 TensorBoard 기록,
-  심볼별 V8 Score 중 낮은 쪽이 최고인 체크포인트를 best로 저장 (모델 선택은 V8 Score 전용)
+  거래수/승률/PnL/복리/v9_score를 TensorBoard 기록,
+  BTC 월별 복리 log-multiple의 평균−표준편차가 최고인 체크포인트를 best로 저장
+  (2026-07-20, 거래수 가드 포함 — ValidationCallback 주석 참고)
 - lr 3e-4 → 0 선형 감쇠
 
 exit_mode 기본값 "adaptive" (V9 Design.md 9장 Fallback B 확장, "진입만 학습" + 진입 시
@@ -68,12 +72,15 @@ import os
 import sys
 import json
 import argparse
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
 from env import TradingEnvV9  # noqa: E402
-from eval import cache_path_for, split_bounds, run_policy_on_range, compute_metrics, compound_metrics  # noqa: E402
+from eval import (cache_path_for, split_bounds, run_policy_on_range, compute_metrics,  # noqa: E402
+                  compound_metrics, monthly_sel_score, MIN_TRADES_PER_MONTH)
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 MODEL_DIR = os.path.join(ROOT_DIR, "models")
@@ -194,7 +201,9 @@ def build_callbacks(args, cache_paths, bounds, run_name, env_kwargs):
                 return True
             self.last_eval = self.num_timesteps
             scores = {}
-            quarter_scores = None  # BTC 검증 4분할 점수 (모델 선택용)
+            btc_sel = None  # BTC 월별 log-multiple 선택 점수 (2026-07-20: 4분기 v9_score 대체)
+            btc_logs_m = None
+            btc_eligible = False
             for sym, path in cache_paths.items():
                 lo, hi = bounds[path]["valid"]
                 if hi - lo < 100:
@@ -220,40 +229,36 @@ def build_callbacks(args, cache_paths, bounds, run_name, env_kwargs):
                 self.logger.record(f"valid/{sym}/compound_multiple", cm["multiple"])
                 self.logger.record(f"valid/{sym}/compound_mdd_pct", cm["mdd_pct"])
                 if sym == "BTC-USDT-SWAP":
-                    # 2026-07-19: 검증 구간을 시간순 4등분해 각각 채점 — "특정 레짐에서만 버는"
-                    # 체크포인트가 1년 합계로 위장하는 것을 걸러내기 위함 (검증 +1,412 → 테스트
-                    # -242 실측이 계기). train/valid 경계는 그대로 시간순 유지(누출 없음).
-                    quarter_scores = []
-                    edges = np.linspace(lo, hi, 5, dtype=np.int64)
-                    for qi in range(4):
-                        q_lo_ms, q_hi_ms = int(ts[edges[qi]]), int(ts[edges[qi + 1] - 1])
-                        q_trades = [t for t in trades if q_lo_ms <= t["entry_ts"] <= q_hi_ms]
-                        qm = compute_metrics(q_trades, q_lo_ms, q_hi_ms)
-                        quarter_scores.append(qm["v9_score"])
-                        # 분기별 점수는 TB에 따로 안 찍음(차트 과밀) — best_info.json에만 저장
+                    # 2026-07-20: 모델 선택 기준을 "4분기 v9_score 평균−표준편차" →
+                    # "월별 복리 log-multiple 평균−표준편차"로 교체. 근거(0719-1459 런 실측):
+                    # 승률×1000 항이 점수를 지배해 total_pnl +28(사실상 본전, top1 제거 시
+                    # 적자)인 9.5M이 +418인 50M을 제치고 best로 뽑혔고, 실전 운용 방식(전액
+                    # 재투입 복리)과 선택 목적이 어긋나 복리 MDD 99% 체크포인트가 걸러지지
+                    # 않았음. 월 12표본이라 분기 4표본보다 분산 추정도 안정적. 레짐 편중
+                    # 감점(−std)이라는 취지는 그대로 계승. v9_score는 TB 기록으로만 유지.
+                    btc_sel, btc_logs_m = monthly_sel_score(trades, int(ts[lo]), int(ts[hi - 1]))
+                    # "무거래 = 월배수 1.0 = 중립"이 손실 정책보다 우대되는 함정 차단:
+                    # 월평균 거래수 미달이면 best 후보 자격 자체를 박탈 (합격 기준 ①과 동일 문턱)
+                    btc_eligible = m["trades_per_month"] >= MIN_TRADES_PER_MONTH
                 if self.verbose:
                     print(f"[valid @{self.num_timesteps:,}] {sym}: "
                           f"trades={m['trades']} pnl={m['total_pnl']:+.1f} v9_score={m['v9_score']:+.1f}")
-            # 2026-07-19: 모델 선택 기준을 min(BTC,ETH) → BTC 단독으로 변경.
-            # ETH는 지표 기록(TB)만 유지하는 참고용 — min 기준은 만성적으로 ETH에 끌려
-            # 내려가서(BTC/ETH 괴리 미해결) BTC에서 잘하는 체크포인트를 놓치는 문제가 있었음.
-            # 선택 점수 = BTC 4분할 점수의 평균 − 표준편차 (고르게 버는 체크포인트 우대).
-            if quarter_scores is not None:
-                qs = np.asarray(quarter_scores, dtype=np.float64)
-                sel = float(qs.mean() - qs.std())
-                self.logger.record("valid/BTC-USDT-SWAP/v9_score_sel", sel)
-                # 1년 합산 점수는 valid/BTC-USDT-SWAP/v9_score로 이미 기록됨 (중복 제거, 2026-07-19)
+            # 모델 선택은 BTC 단독 (2026-07-19: min(BTC,ETH) 기준은 만성적으로 ETH에 끌려
+            # 내려가 BTC에서 잘하는 체크포인트를 놓쳤음. ETH는 지표 기록만 유지하는 참고용).
+            if btc_sel is not None:
+                self.logger.record("valid/BTC-USDT-SWAP/sel_monthly_log", btc_sel)
                 if len(scores) > 1:
                     self.logger.record("valid/min_v9_score", float(min(scores.values())))  # 참고용으로 계속 기록
-                if sel > self.best_score:
-                    self.best_score = sel
+                if btc_eligible and btc_sel > self.best_score:
+                    self.best_score = btc_sel
                     path = os.path.join(MODEL_DIR, f"{run_name}_best")
                     self.model.save(path)
                     with open(path + "_info.json", "w", encoding="utf-8") as f:
-                        json.dump({"timesteps": self.num_timesteps, "btc_v9_sel": sel,
-                                   "btc_v9_quarters": [round(q, 1) for q in quarter_scores]}, f)
+                        json.dump({"timesteps": self.num_timesteps,
+                                   "btc_sel_monthly_log": round(btc_sel, 4),
+                                   "btc_monthly_multiples": [round(float(np.exp(l)), 3) for l in btc_logs_m]}, f)
                     if self.verbose:
-                        print(f"[valid] new best (BTC V9 sel {sel:+.1f}) -> {path}.zip")
+                        print(f"[valid] new best (BTC monthly-log sel {btc_sel:+.4f}) -> {path}.zip")
             return True
 
     callbacks = [EntCoefSchedule(), ValidationCallback(args.eval_freq)]
@@ -283,7 +288,8 @@ def main():
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--stride", type=int, default=1)
-    parser.add_argument("--episode-days", type=int, default=60)
+    parser.add_argument("--episode-days", type=int, default=30,
+                        help="학습 에피소드 길이(일). 2026-07-20: 60→30 복귀 (60일 런 붕괴 실측, 모듈 독스트링 참고)")
     parser.add_argument("--eval-freq", type=int, default=500_000)
     parser.add_argument("--eval-segments", type=int, default=1)  # 2026-07-19: 세그먼트 분할 폐기 (경계 오차)
     parser.add_argument("--checkpoint-freq", type=int, default=1_000_000)
@@ -353,7 +359,11 @@ def main():
 
     vec_env = DummyVecEnv(env_fns) if args.dummy_vec else SubprocVecEnv(env_fns, start_method="spawn")
 
-    run_name = f"v9_ppo_seed{args.seed}"
+    # 2026-07-19: 런 이름에 시작 시각을 붙여 유니크화 — 재시작 시 TB 런 디렉토리와
+    # models/ 체크포인트(best/final 포함)가 이전 런 산출물을 덮어쓰는 사고 방지.
+    # 2026-07-20: 서버 로컬시간(UTC) 대신 KST로 표기.
+    run_name = f"v9_ppo_seed{args.seed}_{datetime.now(ZoneInfo('Asia/Seoul')).strftime('%m%d-%H%M')}"
+    print(f"run_name: {run_name}")
     model = PPO(
         "MlpPolicy",
         vec_env,

@@ -46,6 +46,8 @@ PRE_HIT_LEVEL = 0.382
 VOL_STRENGTH_PERIOD = 500
 WARMUP_5M = 200
 
+CACHE_VER = "v9b"  # 2026-07-20: 타이밍 피처 4종(rsi_now, ret_5m/15m/1h) 추가 — 구 v9 캐시/체크포인트와 비호환이라 파일명 분리
+
 DTYPE_V9 = [
     ("i_1m", "i4"),
     ("i_5m", "i4"),
@@ -68,6 +70,12 @@ DTYPE_V9 = [
     ("fib_pos", "f4"),                       # (close-end)/(start-end): 0=파동끝, 1=파동시작
     ("pre_hit_0382", "i1"),
     ("wave_age_min", "f4"),
+    # --- 2026-07-20 타이밍 피처 (승률 천장 ~27%의 원인이 "전환 시점 판정 정보 부재"라는
+    # 진단에 따른 추가 — 60d 런 칼손절 즉사 분석 참고). 전부 과거 데이터만 사용(인과적). ---
+    ("rsi_now", "f4"),                       # 직전 마감 5m 캔들의 RSI (divergence용 rsi_previous와 별개로, "지금 과매수/과매도인가")
+    ("ret_5m", "f4"),                        # close(t)/close(t-5분) - 1  (1m 종가 기준 트레일링 수익률)
+    ("ret_15m", "f4"),                       # close(t)/close(t-15분) - 1
+    ("ret_1h", "f4"),                        # close(t)/close(t-60분) - 1
 ]
 
 REPORT_PERCENTILES = [1, 5, 25, 50, 75, 95, 99]
@@ -75,6 +83,7 @@ REPORT_FIELDS = [
     "wave_scale_percent", "wave_duration_day", "rsi_previous",
     "divergence_price_gap_percent", "relative_volume_strength",
     "volatility_ratio", "adx_5m", "fib_pos", "wave_age_min",
+    "rsi_now", "ret_5m", "ret_15m", "ret_1h",
 ]
 
 
@@ -172,7 +181,12 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
     lows_1m = df_1m["low"].values
     closes_1m = df_1m["close"].values
     ts_1m_dt = df_1m["ts_dt"].values
-    ts_1m_ms = (df_1m["ts_dt"].astype("int64") // 10**6).values
+    # 🚨 반드시 ns 해상도를 경유해 epoch ms로 변환할 것 (2026-07-19 버그 수정).
+    # pandas 3.x는 날짜 문자열을 datetime64[us]로 파싱하므로 astype(int64)의 단위가
+    # 환경(pandas 버전)에 따라 ns/us로 달라짐 — us//10^6은 "초"가 되어 ts_1m 캐시가
+    # 초 단위로 저장됐고, ms를 가정하는 wave_age_min(→ d5/d15 관측 게이트 전멸),
+    # trades_per_month(1000배), yearly_breakdown(1970년) 등이 연쇄로 깨졌었음.
+    ts_1m_ms = (df_1m["ts_dt"].astype("datetime64[ns]").astype("int64") // 10**6).values
 
     # --- 전역 피봇 (V8과 동일: 내림차순 df에서 감지 후 오름차순 인덱스로 변환) ---
     print("Calculating global pivots on 5m...")
@@ -312,6 +326,11 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
         denom = start_price - end_price
         fib_pos = (closes_1m[i] - end_price) / denom if denom != 0 else 0.0
 
+        # 타이밍 피처: 트레일링 수익률 (1m 행 인덱스 기준 — 데이터 갭 시 근사, 드묾)
+        ret_5m = closes_1m[i] / closes_1m[i - 5] - 1.0 if i >= 5 else 0.0
+        ret_15m = closes_1m[i] / closes_1m[i - 15] - 1.0 if i >= 15 else 0.0
+        ret_1h = closes_1m[i] / closes_1m[i - 60] - 1.0 if i >= 60 else 0.0
+
         rows.append((
             i, idx_5m, int(ts_1m_ms[i]),
             highs_1m[i], lows_1m[i], closes_1m[i],
@@ -324,17 +343,19 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
             adx_5m_arr[prev_5m_idx], atr_5m_arr[prev_5m_idx],
             fib_pos, 1 if wave_filter_hit else 0,
             wave_age_min,
+            rsis_5m[prev_5m_idx],   # 직전 마감 5m 캔들 RSI (adx/atr와 동일 시점 관례)
+            ret_5m, ret_15m, ret_1h,
         ))
 
     arr = np.array(rows, dtype=DTYPE_V9)
     os.makedirs(CACHE_DIR, exist_ok=True)
     suffix = f"_recent{recent_days}d" if recent_days else ""
-    cache_path = os.path.join(CACHE_DIR, f"features_v9_{symbol}{suffix}.npy")
+    cache_path = os.path.join(CACHE_DIR, f"features_{CACHE_VER}_{symbol}{suffix}.npy")
     np.save(cache_path, arr)
     print(f"[{symbol}] cache saved: {cache_path}  rows={len(arr):,}  ({time.time() - t0:.1f}s)")
 
     report = distribution_report(arr, symbol)
-    report_path = os.path.join(CACHE_DIR, f"dist_report_v9_{symbol}{suffix}.json")
+    report_path = os.path.join(CACHE_DIR, f"dist_report_{CACHE_VER}_{symbol}{suffix}.json")
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
     print(f"[{symbol}] distribution report saved: {report_path}")
