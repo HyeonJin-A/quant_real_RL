@@ -31,7 +31,9 @@ CACHE_DIR = os.path.join(ROOT_DIR, "caches")
 SPLIT_TRAIN_END = 0.70
 SPLIT_VALID_END = 0.85
 
-MIN_TRADES_PER_MONTH = 3.0     # 합격 기준 ①
+MIN_TRADES_PER_MONTH = 10.0    # 합격 기준 ① (2026-07-21: 3→10, 거래횟수 자체는 sel_monthly_log
+                                # 점수에 반영되지 않아 저거래 노이즈 체크포인트가 게이트만 통과하면
+                                # best가 될 수 있었음 — 문턱을 높여 저거래 구간을 더 확실히 차단)
 MAX_TOP1_SHARE = 0.30          # 합격 기준 ②
 NEAR_LIQUIDATION_THRESHOLD = -95.0  # 증거금(100) 거의 다 날린 거래 판정 기준 (관측 전용, 학습/점수 미반영)
 
@@ -63,16 +65,21 @@ def split_bounds(cache_paths):
 
 def run_policy_on_range(model, cache_path, lo, hi, n_segments=1, decision_stride=1, fee_rate=0.0005,
                         exit_mode="rule", sl_multiplier=None, tp_half_level=None,
-                        be_trigger_level=None, max_hold_bars=None):
+                        be_trigger_level=None, max_hold_bars=None, leverage=None, leverage_max=None):
     """
     [lo, hi) 구간을 시간순으로 롤아웃. 기본 n_segments=1 = 세그먼트 분할 없음 (2026-07-19:
     16분할 병렬은 경계 강제정산 + 재수렴 구간 때문에 거래수 ~8%/pnl ~12% 오차가 실측돼 폐기 —
     실전과 완벽히 동일한 단일 연속 롤아웃이 기본). n_segments>1은 빠른 근사가 필요할 때만.
+
+    leverage: rule/rl 모드 전용 고정 레버리지. leverage_max: adaptive 모드 전용 레버리지 상한
+    (학습 때 --leverage로 고정 상한 베이스라인을 구성했다면 평가도 반드시 동일 값을 지정할 것
+    — 기본값(전체 범위)과 다르면 정책이 학습 때와 다른 선택 폭/관측을 보게 됨, 2026-07-20).
     """
     env_kwargs = {"decision_stride": decision_stride, "fee_rate": fee_rate,
                   "fixed_full_range": True, "exit_mode": exit_mode}
     for key, val in (("sl_multiplier", sl_multiplier), ("tp_half_level", tp_half_level),
-                     ("be_trigger_level", be_trigger_level), ("max_hold_bars", max_hold_bars)):
+                     ("be_trigger_level", be_trigger_level), ("max_hold_bars", max_hold_bars),
+                     ("leverage", leverage), ("leverage_max", leverage_max)):
         if val is not None:
             env_kwargs[key] = val
 
@@ -243,7 +250,7 @@ def acceptance(metrics, trades, baseline_score=None):
     pnls = np.array([t["pnl"] for t in trades], dtype=np.float64) if trades else np.array([])
     top1_win = float(pnls[pnls > 0].max()) if len(pnls[pnls > 0]) else 0.0
     result = {
-        "1_trades_per_month_ge_3": metrics["trades_per_month"] >= MIN_TRADES_PER_MONTH,
+        "1_trades_per_month_ge_10": metrics["trades_per_month"] >= MIN_TRADES_PER_MONTH,
         "2_top1_share_le_30pct": (metrics["total_pnl"] > 0 and metrics["top1_share"] <= MAX_TOP1_SHARE),
         "3_profitable_without_top1": (metrics["total_pnl"] - top1_win) > 0,
     }
@@ -275,7 +282,7 @@ def fmt_compound(cm):
 def evaluate(model, symbols, split, fee_rate=0.0005, decision_stride=1,
              n_segments=1, cache_suffix="", baseline_score=None, verbose=True,
              exit_mode="rule", sl_multiplier=None, tp_half_level=None,
-             be_trigger_level=None, max_hold_bars=None):
+             be_trigger_level=None, max_hold_bars=None, leverage=None, leverage_max=None):
     paths = {s: cache_path_for(s, cache_suffix) for s in symbols}
     bounds = split_bounds(list(paths.values()))
     report = {"split": split, "fee_rate": fee_rate, "exit_mode": exit_mode, "symbols": {}}
@@ -290,7 +297,7 @@ def evaluate(model, symbols, split, fee_rate=0.0005, decision_stride=1,
                                      decision_stride=decision_stride, fee_rate=fee_rate,
                                      exit_mode=exit_mode, sl_multiplier=sl_multiplier,
                                      tp_half_level=tp_half_level, be_trigger_level=be_trigger_level,
-                                     max_hold_bars=max_hold_bars)
+                                     max_hold_bars=max_hold_bars, leverage=leverage, leverage_max=leverage_max)
         m = compute_metrics(trades, int(ts[lo]), int(ts[hi - 1]))
         cm = compound_metrics(trades, int(ts[lo]), int(ts[hi - 1]))
         acc = acceptance(m, trades, baseline_score)
@@ -333,10 +340,16 @@ def main():
                         help="비교 베이스라인의 V9 Score (합격 기준 ④ 판정용, 2026-07-19 v8_score 폐기)")
     parser.add_argument("--exit-mode", choices=["rl", "rule", "adaptive"], default="adaptive",
                         help="모델 학습 때 쓴 exit_mode와 반드시 일치해야 함 (adaptive=레버리지/손절/반익/완익 전부 정책이 결정, "
-                             "rule=V9 Design.md 9장 Fallback B 전역 고정 청산, rl=풀 컨트롤)")
+                             "rule=V9 Design.md 9장 Fallback B 전역 고정 청산, rl=보유 중 풀 컨트롤·방향 fade 고정)")
     parser.add_argument("--sl-multiplier", type=float, default=None)
     parser.add_argument("--tp-half-level", type=float, default=None)
     parser.add_argument("--be-trigger-level", type=float, default=None)
+    parser.add_argument("--leverage", type=float, default=None,
+                        help="rule/rl 모드 고정 레버리지. 학습 때 --leverage를 지정했다면 반드시 동일 값 지정 "
+                             "(rl 모드는 liq_dist 관측 피처가 leverage에 의존하므로 불일치 시 평가가 왜곡됨)")
+    parser.add_argument("--leverage-max", type=float, default=None,
+                        help="adaptive 모드 레버리지 상한 베이스라인. 학습 때 train.py --leverage를 지정했다면 "
+                             "반드시 동일 값 지정 (예: --leverage-max 1로 학습한 모델은 평가도 1로)")
     parser.add_argument("--out", default=None, help="리포트 JSON 저장 경로")
     args = parser.parse_args()
 
@@ -350,7 +363,8 @@ def main():
                       decision_stride=args.stride, n_segments=args.segments,
                       cache_suffix=args.cache_suffix, baseline_score=args.baseline_score,
                       exit_mode=args.exit_mode, sl_multiplier=args.sl_multiplier,
-                      tp_half_level=args.tp_half_level, be_trigger_level=args.be_trigger_level)
+                      tp_half_level=args.tp_half_level, be_trigger_level=args.be_trigger_level,
+                      leverage=args.leverage, leverage_max=args.leverage_max)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2, ensure_ascii=False, default=str)

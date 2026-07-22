@@ -89,6 +89,14 @@ LOG_DIR = os.path.join(ROOT_DIR, "logs")
 LR_START = 3e-4
 
 
+def mode_subdir(exit_mode):
+    """2026-07-20: 모델/로그 산출물을 exit_mode별 폴더로 분리 — rl은 v9_fullctrl/,
+    adaptive/rule은 v9_adaptive_ppo/ (rule은 adaptive와 기존에 파일명 접두사(v9_ppo_)를
+    공유하던 관례를 그대로 이어받아 같은 폴더 사용). 세 모드 다 알고리즘은 PPO로 동일 —
+    폴더명이 "fullctrl"인 이유는 mode_tag와 동일(train.py 상단 주석 참고)."""
+    return "v9_fullctrl" if exit_mode == "rl" else "v9_adaptive_ppo"
+
+
 def make_env_fn(cache_path, lo, hi, episode_len_rows, decision_stride, seed, env_kwargs):
     def _init():
         from stable_baselines3.common.monitor import Monitor
@@ -104,6 +112,8 @@ def make_env_fn(cache_path, lo, hi, episode_len_rows, decision_stride, seed, env
 
 def build_callbacks(args, cache_paths, bounds, run_name, env_kwargs):
     from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
+    model_dir = os.path.join(MODEL_DIR, mode_subdir(args.exit_mode))
+    os.makedirs(model_dir, exist_ok=True)
 
     class EntCoefSchedule(BaseCallback):
         """--ent-coef-hold-frac 지점까지 시작값 고정 유지 후, 나머지 구간에서만 선형 감쇠.
@@ -251,7 +261,7 @@ def build_callbacks(args, cache_paths, bounds, run_name, env_kwargs):
                     self.logger.record("valid/min_v9_score", float(min(scores.values())))  # 참고용으로 계속 기록
                 if btc_eligible and btc_sel > self.best_score:
                     self.best_score = btc_sel
-                    path = os.path.join(MODEL_DIR, f"{run_name}_best")
+                    path = os.path.join(model_dir, f"{run_name}_best")
                     self.model.save(path)
                     with open(path + "_info.json", "w", encoding="utf-8") as f:
                         json.dump({"timesteps": self.num_timesteps,
@@ -263,20 +273,29 @@ def build_callbacks(args, cache_paths, bounds, run_name, env_kwargs):
 
     callbacks = [EntCoefSchedule(), ValidationCallback(args.eval_freq)]
     if args.exit_mode == "adaptive":
+        # log_std 클램프는 adaptive 전용 개념 — rl 모드는 Discrete(이산) 행동이라 log_std
+        # 자체가 없음(폭주 위험 없음).
         callbacks.append(LogStdClampCallback(args.log_std_min, args.log_std_max))
-        if args.explore_bonus_start > 0:
-            callbacks.append(ExploreBonusSchedule(
-                args.explore_bonus_start, args.explore_bonus_decay_frac * args.timesteps,
-            ))
-        if args.leverage_max_start < args.leverage_max_full:
+        # 2026-07-20: --leverage가 주어지면 "고정 상한 베이스라인" 모드 — 커리큘럼(학습 중
+        # 탐험 분산 억제용, 평가는 항상 무시)이 아니라 학습/검증/평가 전체에 동일 상한을
+        # 관통시키는 게 목적이라 커리큘럼 램프를 끄고 env_kwargs["leverage_max"]를 상수로 고정
+        # (아래 env_kwargs 구성부 참고). --leverage 미지정 시엔 기존 커리큘럼 그대로 유지.
+        if args.leverage is None and args.leverage_max_start < args.leverage_max_full:
             callbacks.append(LeverageMaxSchedule(
                 args.leverage_max_start, args.leverage_max_full,
                 args.leverage_curriculum_frac * args.timesteps,
             ))
+    if args.exit_mode in ("adaptive", "rl") and args.explore_bonus_start > 0:
+        # 2026-07-20: rl 모드에도 explore_bonus 이식 — 06-16 붕괴(진입=확실한 비용,
+        # Hold=항상 0의 구조적 비대칭)에 대한 동일한 대응. env._step_rl의 Enter 액션이
+        # 이 값을 읽는다.
+        callbacks.append(ExploreBonusSchedule(
+            args.explore_bonus_start, args.explore_bonus_decay_frac * args.timesteps,
+        ))
     if args.checkpoint_freq > 0:
         callbacks.append(CheckpointCallback(
             save_freq=max(args.checkpoint_freq // max(args.workers, 1), 1),
-            save_path=MODEL_DIR, name_prefix=run_name,
+            save_path=model_dir, name_prefix=run_name,
         ))
     return callbacks
 
@@ -285,11 +304,21 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbols", nargs="+", default=["BTC-USDT-SWAP", "ETH-USDT-SWAP"])
     parser.add_argument("--timesteps", type=int, default=50_000_000)
-    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--workers", type=int, default=7)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--stride", type=int, default=1)
+    parser.add_argument("--n-steps", type=int, default=2048, help="PPO 롤아웃 버퍼 크기")
+    parser.add_argument("--batch-size", type=int, default=512, help="PPO 미니배치 크기")
+    parser.add_argument("--n-epochs", type=int, default=10, help="PPO 최적화 에포크 수")
+    parser.add_argument("--gamma", type=float, default=0.999, help="할인 계수")
+    parser.add_argument("--gae-lambda", type=float, default=0.95, help="GAE 람다")
+    parser.add_argument("--clip-range", type=float, default=0.2, help="PPO 클리핑 범위")
+    parser.add_argument("--vf-coef", type=float, default=0.5, help="가치 함수 손실 계수")
     parser.add_argument("--episode-days", type=int, default=30,
-                        help="학습 에피소드 길이(일). 2026-07-20: 60→30 복귀 (60일 런 붕괴 실측, 모듈 독스트링 참고)")
+                        help="학습 에피소드 길이(일). 2026-07-20: 60→30 복귀 (60일 런 붕괴 실측, 모듈 독스트링 참고). "
+                             "2026-07-21: rl 모드 기본값을 14일로 잠깐 내렸다가(리셋 빈도 확보 목적) 다음 런 성과가 "
+                             "더 나빠 30일로 원복 — 다만 그 런엔 explore_bonus(0.15)도 그대로 남아있어 원인이 "
+                             "완전히 격리되진 않음 (6장 이력 참고)")
     parser.add_argument("--eval-freq", type=int, default=500_000)
     parser.add_argument("--eval-segments", type=int, default=1)  # 2026-07-19: 세그먼트 분할 폐기 (경계 오차)
     parser.add_argument("--checkpoint-freq", type=int, default=1_000_000)
@@ -299,14 +328,22 @@ def main():
     parser.add_argument("--ent-coef-end", type=float, default=0.005,
                         help="탐험 강도 종료값 (기본 0.005)")
     parser.add_argument("--ent-coef-hold-frac", type=float, default=0.7,
-                        help="전체 스텝 중 이 비율 지점까지 ent_coef_start를 그대로 유지 후 감쇠 시작 (기본 0.7)")
+                        help="전체 스텝 중 이 비율 지점까지 ent_coef_start를 그대로 유지 후 감쇠 시작 (기본 0.7. "
+                             "2026-07-21: 0.85로 상향 시도했으나 같은 런에서 explore_bonus(0.15, 50%까지 유지)가 "
+                             "과매매 붕괴를 오히려 25M까지 더 길게 끌고 간 정황이 드러나 원인이 ent_coef가 아닐 "
+                             "가능성이 높아져 0.7로 원복 — explore_bonus 쪽을 먼저 조정해보기로 함)")
     parser.add_argument("--log-std-min", type=float, default=-3.0,
                         help="adaptive 모드 정책 log_std 하한 (기본 -3.0, std≈0.05). 매 롤아웃 시작 시 강제 clamp")
     parser.add_argument("--log-std-max", type=float, default=1.0,
                         help="adaptive 모드 정책 log_std 상한 (기본 1.0, std≈2.7). 폭주 방지의 핵심 안전장치")
-    parser.add_argument("--explore-bonus-start", type=float, default=0.15,
-                        help="adaptive 모드 전용, Enter 시 붙는 임시 탐험 보너스 초기값 (0이면 비활성화). "
-                             "2026-07-16: 0.05는 고레버리지발 최대손실(-1.0 reward 단위)에 묻혀 무효했음 — 0.15로 상향")
+    parser.add_argument("--explore-bonus-start", type=float, default=0.001,
+                        help="adaptive/rl 공통, Enter 시 붙는 임시 탐험 보너스 초기값 (0이면 비활성화). "
+                             "2026-07-16: 0.05는 adaptive의 고레버리지발 최대손실(-1.0 reward 단위)에 묻혀 "
+                             "무효했음 — 0.15로 상향. 2026-07-21: rl 모드(레버리지 낮음, 기본 1)에서는 이 0.15가 "
+                             "거꾸로 진입 시 확정 수수료비용(leverage×fee_rate, 레버리지1 기준 0.0005)의 300배에 "
+                             "달해 실제 손익 신호를 덮어버림 — '진입을 자주'만 배우고 '잘'은 못 배우게 만듦. "
+                             "0.001(수수료의 약 2배)로 재하향한 런(0722-0702)이 이 세션 rl 모드 최초로 valid+test "
+                             "동시 통과 — 신규 기본값으로 확정 (6장 이력 참고)")
     parser.add_argument("--explore-bonus-decay-frac", type=float, default=0.5,
                         help="전체 스텝 중 이 비율 지점에서 탐험 보너스가 0으로 수렴 (기본 0.5)")
     parser.add_argument("--leverage-max-start", type=float, default=10,
@@ -321,10 +358,19 @@ def main():
     parser.add_argument("--exit-mode", choices=["rl", "rule", "adaptive"], default="adaptive",
                         help="adaptive(기본)=진입 시 정책이 레버리지(1~100)/손절폭/반익절/완익절을 직접 결정, 본절이동 없음. "
                              "rule=V9 Design.md 9장 Fallback B(전역 고정 청산 파라미터, V8 엔진 그대로 재사용). "
-                             "rl=풀 컨트롤 (2026-07-16 seed0에서 거래 붕괴 확인된 이력 있음)")
+                             "rl=보유 중 풀 컨트롤, 방향은 fade 고정·레버리지는 --leverage로 고정 "
+                             "(2026-07-20 재설계 — Discrete(3) {Hold,Enter,Close}, 06-16 자유방향판 붕괴 이력은 env.py 참고)")
     parser.add_argument("--sl-multiplier", type=float, default=None, help="rule 모드 ATR 손절 배수 (기본 1.5, adaptive에선 무시)")
     parser.add_argument("--tp-half-level", type=float, default=None, help="rule 모드 반익절 레벨 (기본 0.30, adaptive에선 무시)")
     parser.add_argument("--be-trigger-level", type=float, default=None, help="rule 모드 본절이동 레벨 (기본 0.60, adaptive엔 없음)")
+    parser.add_argument("--leverage", type=float, default=None,
+                        help="레버리지 값 설정 (모드별 의미가 다름, 2026-07-20). "
+                             "rule/rl: 고정 레버리지 상수(기본 20.0, env.py 생성자 기본값 사용). "
+                             "adaptive: 정책이 고를 수 있는 레버리지 '상한'(leverage_max)을 이 값으로 고정 — "
+                             "기존 --leverage-max-start/-full 커리큘럼(학습 중에만 적용, 평가는 항상 무시)을 "
+                             "대체해 학습/검증/평가 전체에 동일 상한을 관통시킴 (예: --leverage 1로 '레버리지 "
+                             "미사용' 베이스라인 구성). eval.py 평가 시 학습 때와 반드시 동일 값을 지정해야 함 — "
+                             "rl 모드는 liq_dist 관측 피처가, adaptive는 실제 선택 가능 범위가 leverage에 의존.")
     parser.add_argument("--cache-suffix", default="", help="스모크용 캐시 suffix (예: _recent120d)")
     parser.add_argument("--dummy-vec", action="store_true", help="SubprocVecEnv 대신 DummyVecEnv (스모크/디버그)")
     args = parser.parse_args()
@@ -335,6 +381,10 @@ def main():
                          ("be_trigger_level", args.be_trigger_level)):
             if val is not None:
                 env_kwargs[key] = val
+    if args.exit_mode in ("rule", "rl") and args.leverage is not None:
+        env_kwargs["leverage"] = args.leverage
+    if args.exit_mode == "adaptive" and args.leverage is not None:
+        env_kwargs["leverage_max"] = args.leverage
 
     from stable_baselines3 import PPO
     from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
@@ -362,20 +412,31 @@ def main():
     # 2026-07-19: 런 이름에 시작 시각을 붙여 유니크화 — 재시작 시 TB 런 디렉토리와
     # models/ 체크포인트(best/final 포함)가 이전 런 산출물을 덮어쓰는 사고 방지.
     # 2026-07-20: 서버 로컬시간(UTC) 대신 KST로 표기.
-    run_name = f"v9_ppo_seed{args.seed}_{datetime.now(ZoneInfo('Asia/Seoul')).strftime('%m%d-%H%M')}"
+    # 2026-07-20: rl 모드는 접두사를 v9_fullctrl_로 분리 — adaptive/rule(v9_ppo_) 산출물과
+    # 모델/로그 파일명만으로 구분 가능하도록 (rl 모드는 관측/행동 공간이 달라 체크포인트
+    # 호환 안 됨, 이름부터 명확히 갈라둠). 태그를 "rl"로 하지 않은 이유: 세 모드 전부
+    # 알고리즘은 PPO로 동일한데 "ppo" 옆에 "rl"을 나란히 두면 마치 다른 알고리즘처럼
+    # 오해를 사기 때문 — fullctrl(보유 중 풀 컨트롤)로 "환경 모드" 차이임을 명확히 함.
+    # TB 로그는 파일명 접두사뿐 아니라 폴더 자체를 분리 — rl은 logs/v9_fullctrl/,
+    # adaptive/rule은 logs/v9_adaptive_ppo/ (rule은 adaptive와 기존에 v9_ppo_ 접두사를
+    # 공유하던 관례를 그대로 이어받아 같은 폴더). TensorBoard --logdir는 하위 폴더를
+    # 재귀 스캔하므로(logs/rl_v9/... 구조로 기존에도 확인됨) 별도 설정 불필요.
+    mode_tag = "fullctrl" if args.exit_mode == "rl" else "ppo"
+    log_subdir = mode_subdir(args.exit_mode)
+    run_name = f"v9_{mode_tag}_seed{args.seed}_{datetime.now(ZoneInfo('Asia/Seoul')).strftime('%m%d-%H%M')}"
     print(f"run_name: {run_name}")
     model = PPO(
         "MlpPolicy",
         vec_env,
         learning_rate=lambda progress_remaining: LR_START * progress_remaining,
-        n_steps=2048,
-        batch_size=512,
-        n_epochs=10,
-        gamma=0.999,               # 1m 스텝 기준 유효 horizon ~16시간 (V9 Design.md 6장)
-        gae_lambda=0.95,
-        clip_range=0.2,
+        n_steps=args.n_steps,
+        batch_size=args.batch_size,
+        n_epochs=args.n_epochs,
+        gamma=args.gamma,               # 1m 스텝 기준 유효 horizon ~16시간 (V9 Design.md 6장)
+        gae_lambda=args.gae_lambda,
+        clip_range=args.clip_range,
         ent_coef=args.ent_coef_start,   # 콜백에서 --ent-coef-end로 선형 감쇠
-        vf_coef=0.5,
+        vf_coef=args.vf_coef,
         policy_kwargs={"net_arch": [64, 64]},
         seed=args.seed,
         device="cpu",              # CPU 강제 사용 (GPU 미활용 설정)
@@ -383,10 +444,17 @@ def main():
         tensorboard_log=LOG_DIR,
     )
 
-    callbacks = build_callbacks(args, cache_paths, bounds, run_name, env_kwargs)
-    model.learn(total_timesteps=args.timesteps, callback=callbacks, tb_log_name=run_name)
+    # 2026-07-20: model.learn(tb_log_name=...)에 맡기면 SB3가 항상 "{run_name}_{N}"으로
+    # run-id를 붙임(런 이름이 이미 타임스탬프로 유니크라 불필요한 접미사). model.learn() 전에
+    # 커스텀 로거를 직접 설정해두면 SB3가 이걸 존중하고 configure_logger()를 재호출하지
+    # 않아(_custom_logger 플래그, SB3 소스 확인) 정확히 "{run_name}" 경로로 남는다.
+    from stable_baselines3.common.logger import configure as configure_sb3_logger
+    model.set_logger(configure_sb3_logger(os.path.join(LOG_DIR, log_subdir, run_name), ["stdout", "tensorboard"]))
 
-    final_path = os.path.join(MODEL_DIR, f"{run_name}_final")
+    callbacks = build_callbacks(args, cache_paths, bounds, run_name, env_kwargs)
+    model.learn(total_timesteps=args.timesteps, callback=callbacks)
+
+    final_path = os.path.join(MODEL_DIR, log_subdir, f"{run_name}_final")
     model.save(final_path)
     print(f"final model saved: {final_path}.zip")
     vec_env.close()
