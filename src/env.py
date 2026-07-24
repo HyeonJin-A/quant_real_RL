@@ -86,7 +86,6 @@ NORM = {
     "atr_pct_max": 3.0,           # atr/close %
     "hold_log_max": np.log1p(43200.0),       # 분 (30일, rl 모드 포지션 보유시간 정규화 전용)
     "upnl_clip": (-1.5, 3.0),     # 미실현손익 / 100 USDT
-    "liq_dist_max": 10.0,         # %
     # 타이밍 피처: 수익률을 ATR%로 나눈 "몇 ATR만큼 움직였나" 단위의 클립 상한 (2026-07-20).
     # 원시 %는 종목/레짐 간 변동성 차이로 비교 불가라 ATR 정규화 채택 — 조용한 장의 -0.3%와
     # 폭발장의 -0.3%를 구분. 상수는 v9b 분포 리포트(BTC/ETH p1~p99 커버)로 검증 후 확정.
@@ -507,7 +506,13 @@ class TradingEnvV9(gym.Env):
             # (이전엔 클립 범위(-1.5~3.0) 원시값을 그대로 넣어 이 피처만 유독 큰 값 범위를 가졌음).
             obs[OBS_DIM + 1] = float(2.0 * (clipped_upnl - lo_c) / (hi_c - lo_c) - 1.0)
             obs[OBS_DIM + 2] = float(np.log1p(max(hold_min, 0.0)) / NORM["hold_log_max"])
-            obs[OBS_DIM + 3] = float(np.clip(liq_dist, 0.0, NORM["liq_dist_max"]) / NORM["liq_dist_max"])
+            # 2026-07-24: 하드 클립(구 liq_dist_max=10%) 제거 — leverage에 따라 진입 시점부터
+            # liq_dist(~100/leverage%)가 이미 옛 상한을 넘어, 청산 근접 정보가 보유기간 대부분
+            # 1.0으로 뭉개져 있었음. log1p 압축으로 교체: 위험(0 근접) 구간엔 해상도를 몰아주고
+            # 안전 구간은 압축하되 정보를 완전히 버리진 않음 — 기준값은 진입 시점 값(100/leverage)
+            # 이라 obs=1.0이 "진입 때만큼 안전", <1이면 그보다 위험, >1이면 그보다 안전을 의미.
+            liq_dist_ref = 100.0 / self.leverage
+            obs[OBS_DIM + 3] = float(np.log1p(max(liq_dist, 0.0)) / np.log1p(liq_dist_ref))
         return obs
 
     # ---------- 포지션 회계 (rl 모드) ----------

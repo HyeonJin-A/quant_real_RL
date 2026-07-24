@@ -30,6 +30,11 @@ CACHE_DIR = os.path.join(ROOT_DIR, "caches")
 # 시계열 분할 (train 70% / valid 15% / test 15%) — 날짜 기준 공통 경계 (V9 Design.md 7장)
 SPLIT_TRAIN_END = 0.70
 SPLIT_VALID_END = 0.85
+# 2026-07-23: 배포 전 최종학습용 분할 (train 95% / valid 5%, test 없음) — 개발 중 확정된 설정으로
+# 데이터를 최대한 활용해 처음부터 재학습할 때만 사용 (--final-split). 이어학습 아님 — lr/ent_coef/
+# explore_bonus 스케줄이 이미 소진된 기존 체크포인트에 이어붙이면 사실상 더 안 배움 (6장 이력 참고).
+SPLIT_TRAIN_END_FINAL = 0.95
+SPLIT_VALID_END_FINAL = 1.0
 
 MIN_TRADES_PER_MONTH = 10.0    # 합격 기준 ① (2026-07-21: 3→10, 거래횟수 자체는 sel_monthly_log
                                 # 점수에 반영되지 않아 저거래 노이즈 체크포인트가 게이트만 통과하면
@@ -44,13 +49,16 @@ def cache_path_for(symbol, suffix=""):
     return os.path.join(CACHE_DIR, f"features_v9b_{symbol}{suffix}.npy")
 
 
-def split_bounds(cache_paths):
-    """모든 심볼에 공통인 날짜 경계를 계산해 심볼별 행 인덱스 경계로 변환"""
+def split_bounds(cache_paths, final=False):
+    """모든 심볼에 공통인 날짜 경계를 계산해 심볼별 행 인덱스 경계로 변환.
+    final=True면 95/5(train/valid) 최종학습용 분할 사용 — test는 빈 구간이 됨."""
+    train_end, valid_end = (SPLIT_TRAIN_END_FINAL, SPLIT_VALID_END_FINAL) if final \
+        else (SPLIT_TRAIN_END, SPLIT_VALID_END)
     ts_arrays = {p: np.load(p)["ts_1m"] for p in cache_paths}
     t_lo = min(int(a[0]) for a in ts_arrays.values())
     t_hi = max(int(a[-1]) for a in ts_arrays.values())
-    t_train_end = t_lo + (t_hi - t_lo) * SPLIT_TRAIN_END
-    t_valid_end = t_lo + (t_hi - t_lo) * SPLIT_VALID_END
+    t_train_end = t_lo + (t_hi - t_lo) * train_end
+    t_valid_end = t_lo + (t_hi - t_lo) * valid_end
     bounds = {}
     for p, ts in ts_arrays.items():
         i_train = int(np.searchsorted(ts, t_train_end))
@@ -282,9 +290,10 @@ def fmt_compound(cm):
 def evaluate(model, symbols, split, fee_rate=0.0005, decision_stride=1,
              n_segments=1, cache_suffix="", baseline_score=None, verbose=True,
              exit_mode="rule", sl_multiplier=None, tp_half_level=None,
-             be_trigger_level=None, max_hold_bars=None, leverage=None, leverage_max=None):
+             be_trigger_level=None, max_hold_bars=None, leverage=None, leverage_max=None,
+             final_split=False):
     paths = {s: cache_path_for(s, cache_suffix) for s in symbols}
-    bounds = split_bounds(list(paths.values()))
+    bounds = split_bounds(list(paths.values()), final=final_split)
     report = {"split": split, "fee_rate": fee_rate, "exit_mode": exit_mode, "symbols": {}}
     all_trades = []
     for sym, path in paths.items():
@@ -351,12 +360,16 @@ def main():
                         help="adaptive 모드 레버리지 상한 베이스라인. 학습 때 train.py --leverage를 지정했다면 "
                              "반드시 동일 값 지정 (예: --leverage-max 1로 학습한 모델은 평가도 1로)")
     parser.add_argument("--out", default=None, help="리포트 JSON 저장 경로")
+    parser.add_argument("--final-split", action="store_true",
+                        help="배포 전 최종학습용 95/5(train/valid) 분할 기준으로 평가 (test 없음, 2026-07-23)")
     args = parser.parse_args()
 
     from stable_baselines3 import PPO
     model = PPO.load(args.model, device="cpu")
 
     if args.split == "test":
+        if args.final_split:
+            raise SystemExit("--final-split엔 test 구간이 없습니다 (train 95%/valid 5%).")
         print("⚠️  테스트셋 평가는 모든 개발이 끝난 뒤 단 1회만 수행해야 합니다 (V9 Design.md 8장).")
 
     report = evaluate(model, args.symbols, args.split, fee_rate=args.fee,
@@ -364,7 +377,8 @@ def main():
                       cache_suffix=args.cache_suffix, baseline_score=args.baseline_score,
                       exit_mode=args.exit_mode, sl_multiplier=args.sl_multiplier,
                       tp_half_level=args.tp_half_level, be_trigger_level=args.be_trigger_level,
-                      leverage=args.leverage, leverage_max=args.leverage_max)
+                      leverage=args.leverage, leverage_max=args.leverage_max,
+                      final_split=args.final_split)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2, ensure_ascii=False, default=str)

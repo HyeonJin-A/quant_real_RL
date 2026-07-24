@@ -41,6 +41,11 @@ PIVOT_MIN_DIFF = 0.02
 PIVOT_PARAMS = {
     "BTC-USDT-SWAP": {"n": 3, "min_diff": 0.0075},
     "ETH-USDT-SWAP": {"n": 4, "min_diff": 0.015},
+    # 2026-07-23: SOL은 별도 그리드서치 없이 ETH와 동일값 사용 (사용자 지정)
+    "SOL-USDT-SWAP": {"n": 4, "min_diff": 0.015},
+    # 2026-07-23: XRP는 아직 원본 데이터(data/candle_data/)가 없어 캐시는 미생성 — 나중에 데이터가
+    # 준비되면 파라미터만 바로 쓸 수 있도록 등록만 해둠 (사용자 지정)
+    "XRP-USDT-SWAP": {"n": 4, "min_diff": 0.04},
 }
 PRE_HIT_LEVEL = 0.382
 VOL_STRENGTH_PERIOD = 500

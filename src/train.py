@@ -76,6 +76,13 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import numpy as np
+import torch
+
+# 2026-07-24: torch 기본 intra-op 스레드 수(보통 4, nproc 기반 자동설정)가 [64,64] 초소형
+# MLP엔 오히려 손해 — 스레드 동기화 오버헤드가 실제 연산량을 넘어서 메인 프로세스가 항상
+# ~400%(코어 4개)를 잡아먹으면서도 SubprocVecEnv 워커들은 대부분 유휴 상태였음(실측: CPU
+# 사용률 260%대에서 병목 진단). 1로 낮추자 fps가 스모크 테스트 기준 약 2450→3200(+30%) 개선.
+torch.set_num_threads(1)
 
 sys.path.insert(0, os.path.dirname(__file__))
 from env import TradingEnvV9  # noqa: E402
@@ -303,6 +310,10 @@ def build_callbacks(args, cache_paths, bounds, run_name, env_kwargs):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbols", nargs="+", default=["BTC-USDT-SWAP", "ETH-USDT-SWAP"])
+    parser.add_argument("--final-split", action="store_true",
+                        help="배포 전 최종학습용 95/5(train/valid) 분할 사용 (기본은 개발용 70/15/15). "
+                             "이어학습이 아니라 처음부터 새로 학습해야 함 — 기존 체크포인트는 lr/ent_coef/"
+                             "explore_bonus 스케줄이 이미 소진돼 있어 이어붙여도 사실상 안 배움 (2026-07-23)")
     parser.add_argument("--timesteps", type=int, default=50_000_000)
     parser.add_argument("--workers", type=int, default=7)
     parser.add_argument("--seed", type=int, default=0)
@@ -336,14 +347,16 @@ def main():
                         help="adaptive 모드 정책 log_std 하한 (기본 -3.0, std≈0.05). 매 롤아웃 시작 시 강제 clamp")
     parser.add_argument("--log-std-max", type=float, default=1.0,
                         help="adaptive 모드 정책 log_std 상한 (기본 1.0, std≈2.7). 폭주 방지의 핵심 안전장치")
-    parser.add_argument("--explore-bonus-start", type=float, default=0.001,
+    parser.add_argument("--explore-bonus-start", type=float, default=None,
                         help="adaptive/rl 공통, Enter 시 붙는 임시 탐험 보너스 초기값 (0이면 비활성화). "
+                             "미지정 시 모드별 기본값 — rl=0.003, adaptive=0.001. "
                              "2026-07-16: 0.05는 adaptive의 고레버리지발 최대손실(-1.0 reward 단위)에 묻혀 "
                              "무효했음 — 0.15로 상향. 2026-07-21: rl 모드(레버리지 낮음, 기본 1)에서는 이 0.15가 "
                              "거꾸로 진입 시 확정 수수료비용(leverage×fee_rate, 레버리지1 기준 0.0005)의 300배에 "
                              "달해 실제 손익 신호를 덮어버림 — '진입을 자주'만 배우고 '잘'은 못 배우게 만듦. "
                              "0.001(수수료의 약 2배)로 재하향한 런(0722-0702)이 이 세션 rl 모드 최초로 valid+test "
-                             "동시 통과 — 신규 기본값으로 확정 (6장 이력 참고)")
+                             "동시 통과. 2026-07-24: rl 기본 레버리지가 3으로 오르며 확정 수수료비용도 3배(0.0015)가 "
+                             "돼, 같은 2배 비율 유지를 위해 rl 기본값을 0.003으로 재조정 (6장 이력 참고)")
     parser.add_argument("--explore-bonus-decay-frac", type=float, default=0.5,
                         help="전체 스텝 중 이 비율 지점에서 탐험 보너스가 0으로 수렴 (기본 0.5)")
     parser.add_argument("--leverage-max-start", type=float, default=10,
@@ -364,8 +377,10 @@ def main():
     parser.add_argument("--tp-half-level", type=float, default=None, help="rule 모드 반익절 레벨 (기본 0.30, adaptive에선 무시)")
     parser.add_argument("--be-trigger-level", type=float, default=None, help="rule 모드 본절이동 레벨 (기본 0.60, adaptive엔 없음)")
     parser.add_argument("--leverage", type=float, default=None,
-                        help="레버리지 값 설정 (모드별 의미가 다름, 2026-07-20). "
-                             "rule/rl: 고정 레버리지 상수(기본 20.0, env.py 생성자 기본값 사용). "
+                        help="레버리지 값 설정 (모드별 의미가 다름, 2026-07-20). 미지정 시 rl 모드만 "
+                             "3.0으로 기본 설정(2026-07-24, 0724-0001 베이스라인 값 — leverage=1 대비 "
+                             "test에서도 total_pnl/PF/복리 대폭 개선 확인, 5장 참고). "
+                             "rule/rl: 고정 레버리지 상수(rule 기본 20.0, env.py 생성자 기본값 사용). "
                              "adaptive: 정책이 고를 수 있는 레버리지 '상한'(leverage_max)을 이 값으로 고정 — "
                              "기존 --leverage-max-start/-full 커리큘럼(학습 중에만 적용, 평가는 항상 무시)을 "
                              "대체해 학습/검증/평가 전체에 동일 상한을 관통시킴 (예: --leverage 1로 '레버리지 "
@@ -374,6 +389,10 @@ def main():
     parser.add_argument("--cache-suffix", default="", help="스모크용 캐시 suffix (예: _recent120d)")
     parser.add_argument("--dummy-vec", action="store_true", help="SubprocVecEnv 대신 DummyVecEnv (스모크/디버그)")
     args = parser.parse_args()
+    if args.leverage is None and args.exit_mode == "rl":
+        args.leverage = 3.0
+    if args.explore_bonus_start is None:
+        args.explore_bonus_start = 0.003 if args.exit_mode == "rl" else 0.001
 
     env_kwargs = {"exit_mode": args.exit_mode}
     if args.exit_mode == "rule":
@@ -396,7 +415,7 @@ def main():
     for s, p in cache_paths.items():
         if not os.path.exists(p):
             raise FileNotFoundError(f"cache not found for {s}: {p} — run prep_features_v9.py first")
-    bounds = split_bounds(list(cache_paths.values()))
+    bounds = split_bounds(list(cache_paths.values()), final=args.final_split)
 
     episode_len_rows = args.episode_days * 1440 // args.stride * args.stride
     env_fns = []
