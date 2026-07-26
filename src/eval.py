@@ -3,8 +3,8 @@ V9 평가 하네스 (V9 Design.md 8장)
 
 - 결정론적 정책으로 분할 구간(train/valid/test) 전체를 롤아웃하고 거래 목록을 수집
 - 지표: 거래수, 월평균 거래수, 승률, 총 PnL, 평균 PnL/거래, 최대 단일 손실(MSL),
-  PnL 표준편차, Profit Factor, Top-1 수익 비중, 누적 PnL 곡선 MDD, V8 Score
-- 사전 확정 합격 기준 ①~③ 자동 판정 (④는 --baseline-score 입력 시)
+  PnL 표준편차, Profit Factor, Top-1 수익 비중, 누적 PnL 곡선 MDD
+- 사전 확정 합격 기준 ①~③ 자동 판정 (④ v9_score 기준은 2026-07-25 v9_score 폐기와 함께 제거됨)
 - 연도별 PnL 분해, 수수료 민감도(--fee)
 - 심볼별 개별 + 합산 리포트 (합격 기준은 심볼별 각각 적용)
 
@@ -120,19 +120,6 @@ def run_policy_on_range(model, cache_path, lo, hi, n_segments=1, decision_stride
     return trades
 
 
-def v9_score(total_pnl, win_rate, top1_pnl=0.0):
-    """2026-07-18: V8 Score를 대체하는 모델 선택 기준. 거래횟수는 이미 충분히 확보되고 있어
-    제외. total_pnl 대신 top1(최대 단일 수익) 1건을 제외한 총수익을 사용 —
-    합격 기준 ③(top1 제거 후 흑자)을 점수화한 것으로, "대박 한 방" 의존 체크포인트가
-    고득점하는 것을 방지. median이 아닌 이 방식을 쓴 이유: 승률 ~23% 구조(잦은 손절 +
-    소수 큰 익절)에선 median pnl이 항상 음수라 총수익과의 연결이 끊기기 때문.
-    2026-07-19: near_liq_pct 페널티 항(×50000) 제거 — 손실 예산 기반 레버리지 상한
-    (env_v9.MAX_TRADE_LOSS_PCT=20)이 근접청산(-95)을 구조적으로 불가능하게 만들어 항상 0인
-    죽은 항이 됨. near_liq_n/pct 지표 자체는 울타리 검증용 경보기로 계속 기록한다(항상 0이어야
-    정상, 0이 아니면 상한 공식 버그)."""
-    return (total_pnl - max(top1_pnl, 0.0)) + win_rate * 1000.0
-
-
 def compute_metrics(trades, ts_lo_ms, ts_hi_ms):
     months = max((ts_hi_ms - ts_lo_ms) / (30.44 * 86400 * 1000), 1e-9)
     if not trades:
@@ -140,8 +127,8 @@ def compute_metrics(trades, ts_lo_ms, ts_hi_ms):
             "trades": 0, "trades_per_month": 0.0, "win_rate": 0.0,
             "total_pnl": 0.0, "avg_pnl": 0.0, "max_single_loss": 0.0,
             "pnl_std": 0.0, "profit_factor": 0.0, "top1_share": 0.0,
-            "mdd": 0.0, "v9_score": 0.0, "months": months,
-            "near_liq_n": 0, "near_liq_pct": 0.0,
+            "mdd": 0.0, "months": months,
+            "near_liq_n": 0, "near_liq_pct": 0.0, "max_upnl": 0.0,
         }
     pnls = np.array([t["pnl"] for t in trades], dtype=np.float64)
     wins = pnls[pnls > 0]
@@ -152,11 +139,17 @@ def compute_metrics(trades, ts_lo_ms, ts_hi_ms):
     top1 = float(wins.max()) if len(wins) else 0.0
     cum = np.cumsum(pnls)
     mdd = float((np.maximum.accumulate(cum) - cum).max())
-    # 증거금(100 USDT) 거의 다 날린 거래 건수 — 학습/V8 Score엔 관여하지 않는 순수 관측 지표.
+    # 증거금(100 USDT) 거의 다 날린 거래 건수 — 순수 관측 지표, 모델 선택엔 미관여.
     # "총 PnL이 좋아도 개별 거래에서 계좌를 거의 다 날리는 일이 실제로 몇 번이나 있었는가"를 직접 확인하기 위함.
     near_liq = int((pnls <= NEAR_LIQUIDATION_THRESHOLD).sum())
     win_rate = len(wins) / len(pnls)
     near_liq_pct = near_liq / len(pnls)
+    # 2026-07-25: upnl_clip(관측 20번칸) 상한 재검토 근거 수집용 참고 지표. rl 모드에서만
+    # env._close_position이 채워주는 거래별 "보유 중 관측된 최대 upnl/증거금 배수"(청산가/종가
+    # 포함) 전체 중 최댓값 — 최종 실현 손익(top1)과 달리 "그 순간 관측값이 최대 몇 배까지
+    # 갔었는가"를 담아, upnl_clip 상한을 몇으로 잡아야 극단값을 놓치지 않는지 판단하는 데 씀.
+    # rule/adaptive 모드 거래엔 이 키가 없어(semi-MDP는 즉시 확정) 0.0으로 처리.
+    max_upnl = max((t.get("max_upnl", 0.0) for t in trades), default=0.0)
     return {
         "trades": int(len(pnls)),
         "trades_per_month": len(pnls) / months,
@@ -168,10 +161,10 @@ def compute_metrics(trades, ts_lo_ms, ts_hi_ms):
         "profit_factor": float(wins.sum() / -losses.sum()) if losses.sum() < 0 else float("inf"),
         "top1_share": top1 / total if total > 0 else float("inf"),
         "mdd": mdd,
-        "v9_score": v9_score(total, win_rate, top1_pnl=top1),
         "months": months,
         "near_liq_n": near_liq,
         "near_liq_pct": near_liq_pct,
+        "max_upnl": max_upnl,
     }
 
 
@@ -253,19 +246,17 @@ def yearly_breakdown(trades):
     return dict(sorted(by_year.items()))
 
 
-def acceptance(metrics, trades, baseline_score=None):
-    """사전 확정 합격 기준 (V9 Design.md 8장). ⑤(시드)는 시드별 리포트를 모아 별도 판정."""
+def acceptance(metrics, trades):
+    """사전 확정 합격 기준 (V9 Design.md 8장). ⑤(시드)는 시드별 리포트를 모아 별도 판정.
+    2026-07-25: v9_score 폐기와 함께 구 ④(v9_score ≥ 베이스라인) 기준 제거 — 모델 선택은
+    이미 sel_monthly_log로 일원화돼 있었고 v9_score는 TB 참고 기록 용도뿐이었음."""
     pnls = np.array([t["pnl"] for t in trades], dtype=np.float64) if trades else np.array([])
     top1_win = float(pnls[pnls > 0].max()) if len(pnls[pnls > 0]) else 0.0
-    result = {
+    return {
         "1_trades_per_month_ge_10": metrics["trades_per_month"] >= MIN_TRADES_PER_MONTH,
         "2_top1_share_le_30pct": (metrics["total_pnl"] > 0 and metrics["top1_share"] <= MAX_TOP1_SHARE),
         "3_profitable_without_top1": (metrics["total_pnl"] - top1_win) > 0,
     }
-    if baseline_score is not None:
-        # 2026-07-19: v8_score 완전 폐기 — 베이스라인 비교도 v9_score 기준으로 통일
-        result["4_v9_score_ge_baseline"] = metrics["v9_score"] >= baseline_score
-    return result
 
 
 def fmt_metrics(m):
@@ -273,9 +264,10 @@ def fmt_metrics(m):
         f"  trades={m['trades']}  /month={m['trades_per_month']:.2f}  win={m['win_rate']*100:.1f}%\n"
         f"  total_pnl={m['total_pnl']:+.1f}  avg={m['avg_pnl']:+.2f}  MSL={m['max_single_loss']:+.1f}\n"
         f"  std={m['pnl_std']:.1f}  PF={m['profit_factor']:.2f}  top1_share={m['top1_share']*100:.1f}%\n"
-        f"  MDD={m['mdd']:.1f}  V9_Score={m['v9_score']:+.1f}\n"
+        f"  MDD={m['mdd']:.1f}\n"
         f"  near_liquidation={m['near_liq_n']}건 ({m['near_liq_pct']*100:.1f}%, "
-        f"pnl<={NEAR_LIQUIDATION_THRESHOLD:.0f} 기준)"
+        f"pnl<={NEAR_LIQUIDATION_THRESHOLD:.0f} 기준)\n"
+        f"  max_upnl={m['max_upnl']:.2f}x (rl 전용 참고, upnl_clip 상한 재검토용)"
     )
 
 
@@ -288,7 +280,7 @@ def fmt_compound(cm):
 
 
 def evaluate(model, symbols, split, fee_rate=0.0005, decision_stride=1,
-             n_segments=1, cache_suffix="", baseline_score=None, verbose=True,
+             n_segments=1, cache_suffix="", verbose=True,
              exit_mode="rule", sl_multiplier=None, tp_half_level=None,
              be_trigger_level=None, max_hold_bars=None, leverage=None, leverage_max=None,
              final_split=False):
@@ -309,7 +301,7 @@ def evaluate(model, symbols, split, fee_rate=0.0005, decision_stride=1,
                                      max_hold_bars=max_hold_bars, leverage=leverage, leverage_max=leverage_max)
         m = compute_metrics(trades, int(ts[lo]), int(ts[hi - 1]))
         cm = compound_metrics(trades, int(ts[lo]), int(ts[hi - 1]))
-        acc = acceptance(m, trades, baseline_score)
+        acc = acceptance(m, trades)
         report["symbols"][sym] = {
             "metrics": m, "compound": cm, "acceptance": acc, "yearly": yearly_breakdown(trades),
         }
@@ -345,9 +337,7 @@ def main():
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--segments", type=int, default=1)
     parser.add_argument("--cache-suffix", default="", help="스모크용 캐시 suffix (예: _recent120d)")
-    parser.add_argument("--baseline-score", type=float, default=None,
-                        help="비교 베이스라인의 V9 Score (합격 기준 ④ 판정용, 2026-07-19 v8_score 폐기)")
-    parser.add_argument("--exit-mode", choices=["rl", "rule", "adaptive"], default="adaptive",
+    parser.add_argument("--exit-mode", choices=["rl", "rule", "adaptive"], default="rl",
                         help="모델 학습 때 쓴 exit_mode와 반드시 일치해야 함 (adaptive=레버리지/손절/반익/완익 전부 정책이 결정, "
                              "rule=V9 Design.md 9장 Fallback B 전역 고정 청산, rl=보유 중 풀 컨트롤·방향 fade 고정)")
     parser.add_argument("--sl-multiplier", type=float, default=None)
@@ -374,7 +364,7 @@ def main():
 
     report = evaluate(model, args.symbols, args.split, fee_rate=args.fee,
                       decision_stride=args.stride, n_segments=args.segments,
-                      cache_suffix=args.cache_suffix, baseline_score=args.baseline_score,
+                      cache_suffix=args.cache_suffix,
                       exit_mode=args.exit_mode, sl_multiplier=args.sl_multiplier,
                       tp_half_level=args.tp_half_level, be_trigger_level=args.be_trigger_level,
                       leverage=args.leverage, leverage_max=args.leverage_max,

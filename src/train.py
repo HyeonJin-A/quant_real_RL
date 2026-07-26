@@ -7,7 +7,7 @@ V9 PPO 학습 (V9 Design.md 7장, 9장)
   스캘핑 분지로 붕괴(승률 16%, PF 0.86)했고, 에피소드만 30일로 되돌린 0719-1459 런이
   스윙형/승률 27%로 정상 복귀한 실측 근거. 업데이트당 레짐 다양성 감소가 유력 원인)
 - 검증 콜백: eval_freq마다 검증셋(15%) 전체 결정론적 롤아웃 →
-  거래수/승률/PnL/복리/v9_score를 TensorBoard 기록,
+  거래수/승률/PnL/복리 지표를 TensorBoard 기록,
   BTC 월별 복리 log-multiple의 평균−표준편차가 최고인 체크포인트를 best로 저장
   (2026-07-20, 거래수 가드 포함 — ValidationCallback 주석 참고)
 - lr 3e-4 → 0 선형 감쇠
@@ -104,8 +104,18 @@ def mode_subdir(exit_mode):
     return "v9_fullctrl" if exit_mode == "rl" else "v9_adaptive_ppo"
 
 
-def make_env_fn(cache_path, lo, hi, episode_len_rows, decision_stride, seed, env_kwargs):
+def make_env_fn(cache_path, lo, hi, episode_len_rows, decision_stride, seed, env_kwargs, worker_idx=0):
     def _init():
+        # 2026-07-25: 워커 프로세스를 코어 1번부터 순차 고정 (부모 Core 0 침범 방지)
+        # 전체 CPU 코어 수(num_cpus)를 반영하여 Core 1 ~ (num_cpus-1) 범위에서 순환 배정
+        if hasattr(os, "sched_setaffinity"):
+            try:
+                num_cpus = os.cpu_count() or 1
+                target_core = 1 + (worker_idx % (num_cpus - 1)) if num_cpus > 1 else 0
+                os.sched_setaffinity(0, {target_core})
+            except Exception:
+                pass
+
         from stable_baselines3.common.monitor import Monitor
         env = TradingEnvV9(
             cache_path, start_idx=lo, end_idx=hi,
@@ -217,8 +227,7 @@ def build_callbacks(args, cache_paths, bounds, run_name, env_kwargs):
             if self.num_timesteps - self.last_eval < self.eval_freq:
                 return True
             self.last_eval = self.num_timesteps
-            scores = {}
-            btc_sel = None  # BTC 월별 log-multiple 선택 점수 (2026-07-20: 4분기 v9_score 대체)
+            btc_sel = None  # BTC 월별 log-multiple 선택 점수
             btc_logs_m = None
             btc_eligible = False
             for sym, path in cache_paths.items():
@@ -232,40 +241,34 @@ def build_callbacks(args, cache_paths, bounds, run_name, env_kwargs):
                 )
                 ts = np.load(path)["ts_1m"]
                 m = compute_metrics(trades, int(ts[lo]), int(ts[hi - 1]))
-                # 2026-07-18: 모델 선택 기준을 v8_score → v9_score로 교체
-                # (top1 제외 total_pnl + win_rate×1000 − near_liq_pct×50000).
-                # 2026-07-19: v8_score는 기록에서도 완전 폐기.
-                scores[sym] = m["v9_score"]
                 for key in ("trades", "trades_per_month", "win_rate", "total_pnl",
-                            "max_single_loss", "pnl_std", "v9_score",
-                            "near_liq_n", "near_liq_pct"):
+                            "max_single_loss", "pnl_std",
+                            "near_liq_n", "near_liq_pct", "max_upnl"):
                     self.logger.record(f"valid/{sym}/{key}", m[key])
                 # 복리(전액 재투입) 지표 — 실전 운용 방식 기준 참고용 기록 (2026-07-19 추가).
-                # 모델 선택에는 미사용 (선택 기준은 v9_score 4분할 평균−표준편차 그대로).
+                # 모델 선택에는 미사용 (선택 기준은 sel_monthly_log 그대로).
                 cm = compound_metrics(trades, int(ts[lo]), int(ts[hi - 1]))
                 self.logger.record(f"valid/{sym}/compound_multiple", cm["multiple"])
                 self.logger.record(f"valid/{sym}/compound_mdd_pct", cm["mdd_pct"])
                 if sym == "BTC-USDT-SWAP":
-                    # 2026-07-20: 모델 선택 기준을 "4분기 v9_score 평균−표준편차" →
-                    # "월별 복리 log-multiple 평균−표준편차"로 교체. 근거(0719-1459 런 실측):
-                    # 승률×1000 항이 점수를 지배해 total_pnl +28(사실상 본전, top1 제거 시
-                    # 적자)인 9.5M이 +418인 50M을 제치고 best로 뽑혔고, 실전 운용 방식(전액
-                    # 재투입 복리)과 선택 목적이 어긋나 복리 MDD 99% 체크포인트가 걸러지지
-                    # 않았음. 월 12표본이라 분기 4표본보다 분산 추정도 안정적. 레짐 편중
-                    # 감점(−std)이라는 취지는 그대로 계승. v9_score는 TB 기록으로만 유지.
+                    # 모델 선택 기준: BTC 월별 복리 log-multiple 평균−표준편차 (2026-07-20).
+                    # 근거(0719-1459 런 실측): 구 v9_score(승률×1000 항 지배)는 total_pnl +28
+                    # (사실상 본전, top1 제거 시 적자)인 9.5M이 +418인 50M을 제치고 best로
+                    # 뽑혔고, 실전 운용 방식(전액 재투입 복리)과 선택 목적이 어긋나 복리 MDD
+                    # 99% 체크포인트가 걸러지지 않았음. 월 12표본이라 분기 4표본보다 분산
+                    # 추정도 안정적. 레짐 편중 감점(−std)이라는 취지는 그대로 계승.
+                    # (2026-07-25: v9_score 자체를 TB 기록에서도 완전 폐기)
                     btc_sel, btc_logs_m = monthly_sel_score(trades, int(ts[lo]), int(ts[hi - 1]))
                     # "무거래 = 월배수 1.0 = 중립"이 손실 정책보다 우대되는 함정 차단:
                     # 월평균 거래수 미달이면 best 후보 자격 자체를 박탈 (합격 기준 ①과 동일 문턱)
                     btc_eligible = m["trades_per_month"] >= MIN_TRADES_PER_MONTH
                 if self.verbose:
                     print(f"[valid @{self.num_timesteps:,}] {sym}: "
-                          f"trades={m['trades']} pnl={m['total_pnl']:+.1f} v9_score={m['v9_score']:+.1f}")
+                          f"trades={m['trades']} pnl={m['total_pnl']:+.1f}")
             # 모델 선택은 BTC 단독 (2026-07-19: min(BTC,ETH) 기준은 만성적으로 ETH에 끌려
             # 내려가 BTC에서 잘하는 체크포인트를 놓쳤음. ETH는 지표 기록만 유지하는 참고용).
             if btc_sel is not None:
                 self.logger.record("valid/BTC-USDT-SWAP/sel_monthly_log", btc_sel)
-                if len(scores) > 1:
-                    self.logger.record("valid/min_v9_score", float(min(scores.values())))  # 참고용으로 계속 기록
                 if btc_eligible and btc_sel > self.best_score:
                     self.best_score = btc_sel
                     path = os.path.join(model_dir, f"{run_name}_best")
@@ -315,7 +318,7 @@ def main():
                              "이어학습이 아니라 처음부터 새로 학습해야 함 — 기존 체크포인트는 lr/ent_coef/"
                              "explore_bonus 스케줄이 이미 소진돼 있어 이어붙여도 사실상 안 배움 (2026-07-23)")
     parser.add_argument("--timesteps", type=int, default=50_000_000)
-    parser.add_argument("--workers", type=int, default=7)
+    parser.add_argument("--workers", type=int, default=6)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--n-steps", type=int, default=2048, help="PPO 롤아웃 버퍼 크기")
@@ -368,7 +371,7 @@ def main():
                              "2026-07-17: 100→50 하향, 근접청산 실측 근거는 LeverageMaxSchedule 독스트링 참고)")
     parser.add_argument("--leverage-curriculum-frac", type=float, default=0.3,
                         help="전체 스텝 중 이 비율 지점에서 레버리지 상한이 leverage-max-full에 도달 (기본 0.3)")
-    parser.add_argument("--exit-mode", choices=["rl", "rule", "adaptive"], default="adaptive",
+    parser.add_argument("--exit-mode", choices=["rl", "rule", "adaptive"], default="rl",
                         help="adaptive(기본)=진입 시 정책이 레버리지(1~100)/손절폭/반익절/완익절을 직접 결정, 본절이동 없음. "
                              "rule=V9 Design.md 9장 Fallback B(전역 고정 청산 파라미터, V8 엔진 그대로 재사용). "
                              "rl=보유 중 풀 컨트롤, 방향은 fade 고정·레버리지는 --leverage로 고정 "
@@ -405,6 +408,15 @@ def main():
     if args.exit_mode == "adaptive" and args.leverage is not None:
         env_kwargs["leverage_max"] = args.leverage
 
+    # 2026-07-25: 메인(부모) 프로세스를 Core 0에 100% 고정 (코어 널뛰기 완벽 방지)
+    if hasattr(os, "sched_setaffinity"):
+        try:
+            os.sched_setaffinity(0, {0})
+            num_cpus = os.cpu_count() or 1
+            print(f"[CPU Affinity] Main process -> Core 0 | {args.workers} workers -> Cores 1~{min(args.workers, num_cpus - 1) if num_cpus > 1 else 0}")
+        except Exception as e:
+            print(f"[CPU Affinity] Failed to set affinity: {e}")
+
     from stable_baselines3 import PPO
     from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 
@@ -424,7 +436,7 @@ def main():
         sym = symbols[w % len(symbols)]  # 워커를 심볼별 균등 배분
         path = cache_paths[sym]
         lo, hi = bounds[path]["train"]
-        env_fns.append(make_env_fn(path, lo, hi, episode_len_rows, args.stride, args.seed * 1000 + w, env_kwargs))
+        env_fns.append(make_env_fn(path, lo, hi, episode_len_rows, args.stride, args.seed * 1000 + w, env_kwargs, worker_idx=w))
 
     vec_env = DummyVecEnv(env_fns) if args.dummy_vec else SubprocVecEnv(env_fns, start_method="spawn")
 

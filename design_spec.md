@@ -2,9 +2,9 @@
 
 본 프로젝트(`quant_real_RL`)는 5m 파동(피봇) 기반 **역추세(fade) 진입을 PPO 정책이 학습하는 V9 강화학습 트레이딩 파이프라인**의 독립 저장소입니다. 기존 `quant_with_RL`에서 V9 메인 로직만 추출해 구축했습니다.
 
-현재 아키텍처는 **`adaptive` semi-MDP 구조**입니다: 정책은 무포지션 결정 시점에만 행동하며, 진입 순간에 레버리지/손절폭/반익절/완익절을 전부 확정하고, 청산까지는 numba 시뮬레이터가 fast-forward하여 실현 손익을 그 스텝의 보상으로 즉시 반환합니다 (결정 1개 = 거래 1개 = 완결된 보상). 초기 설계(`V9 Design.md`)의 풀 컨트롤("rl" 모드)은 "아무것도 안 함" 붕괴로 폐기되었고, 본 문서가 현행 사양의 기준입니다.
+현재 아키텍처는 **`rl` 모드(보유 중 풀 컨트롤)**가 주력입니다: 정책이 매 1분 행마다 Hold/Enter/Close를 직접 결정하고, 보상은 매 스텝 mark-to-market 손익 변화량(dense reward)입니다. 초기 설계(`V9 Design.md`)의 풀 컨트롤은 2026-07-16 "아무것도 안 함" 붕괴로 한 차례 폐기됐었으나, 2026-07-20 재설계(방향 fade 고정 + explore_bonus 이식)로 재도전해 현재 주력 모드로 자리잡았습니다 (`train.py`/`eval.py` `--exit-mode` 기본값도 2026-07-25부터 `rl`). `adaptive`(semi-MDP, 진입 시 레버리지/손절/반익/완익 전부 확정)와 `rule`(V8 엔진 고정 청산)은 레거시로 유지됩니다. 본 문서가 현행 사양의 기준입니다.
 
-*최종 갱신: 2026-07-20*
+*최종 갱신: 2026-07-25*
 
 ---
 
@@ -75,9 +75,9 @@ quant_real_RL/
 ### <span style="color: #2E8B57;">exit_mode 3종과 현행 모드</span>
 | 모드 | 행동 공간 | 상태 | 비고 |
 |---|---|---|---|
-| **adaptive** (현행 기본) | Box(-1,1)^6 연속 | **주력** | 진입 시 레버리지/손절/반익/완익까지 정책이 전부 결정, semi-MDP |
+| adaptive | Box(-1,1)^6 연속 | 레거시 | 진입 시 레버리지/손절/반익/완익까지 정책이 전부 결정, semi-MDP |
 | rule | Discrete(2) Skip/Enter | 레거시 | 청산은 V8 엔진(반익절/본절이동/ATR손절) 고정 — Fallback B |
-| rl | Discrete(3) Hold/Enter/Close | **재도전 중 (2026-07-20 재설계)** | 보유 중 풀 컨트롤(완익 사전결정 구조 이슈 최후 후보안). 방향은 fade 고정, 레버리지는 `--leverage` 고정 상수. 2026-07-16 자유방향판(Discrete4)은 "거래 0건" 붕괴로 폐기, 아래 소절 참고 |
+| **rl** (2026-07-25부터 `train.py`/`eval.py` `--exit-mode` 기본값) | Discrete(3) Hold/Enter/Close | **주력, 재도전 중 (2026-07-20 재설계)** | 보유 중 풀 컨트롤(완익 사전결정 구조 이슈 최후 후보안). 방향은 fade 고정, 레버리지는 `--leverage` 고정 상수. 2026-07-16 자유방향판(Discrete4)은 "거래 0건" 붕괴로 폐기, 아래 소절 참고 |
 
 ### <span style="color: #2E8B57;">관측 공간 (18차원, `_build_static_obs`에서 전 행 사전 정규화)</span>
 | # | 피처 | 정규화 |
@@ -190,7 +190,7 @@ leverage_max = clip( 20 / (gap% + ATR% × 선택한 sl_multiplier + 0.1), 1, 50 
 - 시계열 70/15/15 (train/valid/test), 날짜 경계는 두 심볼 공통. **테스트셋은 모든 개발 종료 후 단 1회만 평가.**
 - **최종학습용 분할 (2026-07-23, `--final-split`)**: 배포 전, 개발 중 확정된 설정으로 처음부터 재학습할 때 95/5(train/valid, test 없음)로 전환. `train.py`/`eval.py` 둘 다 지원(`split_bounds(..., final=True)`). ⚠️ 기존 체크포인트에 이어학습하는 게 아니라 **처음부터 새로 학습**해야 함 — lr(`progress_remaining` 기반 선형 감쇠)·ent_coef·explore_bonus 스케줄이 이미 소진된 상태로 이어붙이면 사실상 새 데이터를 거의 못 배움.
 - 평가는 분할 구간 전체 **단일 연속 롤아웃** (2026-07-19: 16분할 병렬은 경계 오차 ~8-12% 실측으로 폐기).
-- 지표: 거래수, 월평균 거래수, 승률, 총 PnL, 평균 PnL, MSL, PnL 표준편차, PF, top1_share, MDD, near_liquidation 건수, V9 Score, 연도별 분해, 수수료 민감도(`--fee`).
+- 지표: 거래수, 월평균 거래수, 승률, 총 PnL, 평균 PnL, MSL, PnL 표준편차, PF, top1_share, MDD, near_liquidation 건수, 연도별 분해, 수수료 민감도(`--fee`), `max_upnl`(rl 모드 전용, 아래 참고). (V9 Score는 2026-07-25 완전 폐기, 아래 참고)
 
 ### <span style="color: #2E8B57;">모델 선택 기준: BTC 월별 복리 log-multiple (2026-07-20 교체)</span>
 ```
@@ -203,10 +203,17 @@ m_i = ∏(1 + pnl/100)          # 달력 월 i의 거래들, 월초 자본 1.0 �
 ```
 - **mean(ln m)의 최대화 = 실제 복리 성장률 최대화와 동치** — 선택 목적을 실전 운용 방식(전액 재투입 복리)과 정합시킴. −std는 레짐 편중 감점(기존 4분기 선택식의 취지 계승, 표본 4→12로 안정화).
 - 교체 근거 (0719-1459 런 실측): 구 기준 `4분기 v9_score 평균−std`는 승률×1000 항이 점수를 지배해, total_pnl +28(top1 제거 시 적자)인 9.5M 체크포인트가 +418인 50M을 제치고 best로 선택됐고, 복리 MDD 99% 경로도 걸러내지 못했음.
-- `v9_score = (total_pnl − top1) + win_rate×1000`은 TB 기록·합격 기준 ④용 지표로만 유지.
+- `v9_score = (total_pnl − top1) + win_rate×1000`은 TB 기록·합격 기준 ④용 지표로만 유지되다가 **2026-07-25 완전 폐기**됨 (아래 「사전 확정 합격 기준」 참고).
 - 모델 선택은 **BTC 단독** (2026-07-19): min(BTC,ETH) 기준은 만성적으로 ETH에 끌려 내려가 BTC에서 잘하는 체크포인트를 놓치는 문제. ETH는 TB 지표 기록만 유지.
 - near_liq(pnl≤-95) 지표는 **울타리 검증용 경보기** — 동적 레버리지 상한이 정상이면 항상 0이어야 하며, 0이 아니면 상한 공식 버그.
 - V8 Score는 완전 폐기 (2026-07-19).
+
+### <span style="color: #2E8B57;">`max_upnl` 참고 지표 (2026-07-25 추가, rl 모드 전용)</span>
+- **목적**: 관측 20번칸 `upnl_clip`(현재 `(-1.5, 3.0)`) 상한을 조정할 근거 데이터 수집용. 모델 선택·보상·합격 기준 어디에도 관여하지 않는 순수 관측 지표.
+- **정의**: 거래 1건이 보유되는 동안 매 분봉마다 관측된 `_unrealized(close)/MARGIN_USDT`(미실현손익/증거금) 값 중 최댓값(청산가/종가 체결 시점 포함) — 이걸 전체 거래에 대해 다시 최댓값을 취해 검증 1회당 스칼라 하나로 집계. "실현 손익 기준 최대 수익(top1)"과 달리, **최종 실현 여부와 무관하게 보유 중 관측치가 실제로 얼마나 커질 수 있었는지**를 담는다 (예: 크게 불었다가 반납하고 닫힌 거래도 여기엔 그 순간의 피크값이 잡힘).
+- `env.py`: `_open_position`에서 거래별 `self._trade_peak_upnl`을 0.0으로 리셋, `_step_rl`의 매 분봉 강제청산 체크 루프에서 갱신, `_close_position`이 trade dict에 `max_upnl` 필드로 기록. rule/adaptive 모드는 semi-MDP라 이 필드가 없음(`eval.py`에서 `.get(..., 0.0)`로 처리, 항상 0.0).
+- `eval.py`: `compute_metrics()` 반환값에 `max_upnl` 추가, `fmt_metrics()` 출력에도 포함.
+- `train.py`: `ValidationCallback`이 매 검증마다 `valid/{SYM}/max_upnl`로 TensorBoard에 기록.
 
 ### <span style="color: #2E8B57;">복리 평가 지표 (`compound_metrics`, 2026-07-19 추가 — 평가 전용)</span>
 - 실전 운용 방식 기준: **시작 자본 100 USDT, 매 거래 전재산을 증거금으로 투입**하는 복리 시뮬레이션. 산출: 최종 자본, 성장 배수(multiple), 월평균 성장 배수, 복리 자본곡선 MDD(%), 파산 여부.
@@ -219,8 +226,9 @@ m_i = ∏(1 + pnl/100)          # 달력 월 i의 거래들, 월초 자본 1.0 �
 | ① | 테스트 구간 월평균 10회 이상 거래 (2026-07-21: 3→10) |
 | ② | 최대 단일 수익 ≤ 총수익의 30% |
 | ③ | Top-1 수익 거래 제거 후에도 총 PnL > 0 |
-| ④ | 테스트 v9_score ≥ 베이스라인 (`--baseline-score` 입력 시) |
 | ⑤ | 3시드 중 2시드 이상 ①~③ 통과 (시드별 리포트 취합 후 별도 판정) |
+
+⚠️ **2026-07-25: 구 ④(테스트 v9_score ≥ 베이스라인) 제거** — 사용자 명시적 지시로 `v9_score` 지표 자체를 코드에서 완전히 삭제(`eval.py`의 `v9_score()` 함수, `--baseline-score` CLI 옵션, `compute_metrics()`/`fmt_metrics()`/`acceptance()`의 관련 필드 전부 제거). 모델 선택은 이미 `sel_monthly_log`로 일원화돼 있었고 v9_score는 TB 참고 기록 + 이 기준 ④ 용도뿐이었음. 번호는 원래 목록 그대로 유지(④ 결번, ⑤는 그대로) — 원 문서와의 대조 편의를 위함.
 
 - 사용법: `python src/eval.py --model models/v9_ppo_seed0_best.zip --split valid` (exit_mode는 학습 때와 일치 필수, 기본 adaptive)
 
@@ -289,6 +297,13 @@ m_i = ∏(1 + pnl/100)          # 달력 월 i의 거래들, 월초 자본 1.0 �
 | 07-24 | **torch 스레드 수 1로 고정 (`train.py` 상단)** | CPU 사용률이 8코어 중 260%대에 머무는 걸 조사하다가, 메인 프로세스(정책망 추론)가 torch 기본 스레드 수(4)로 지속 400% CPU를 쓰는 반면 `SubprocVecEnv` 워커 6개는 각각 5~18%밖에 못 쓰고 있음을 발견 — `[64,64]` 초소형 MLP엔 멀티스레드 동기화 비용이 실제 연산량보다 커서 오히려 손해였음. `torch.set_num_threads(1)`로 고정 후 스모크 테스트 기준 fps 2450→3862(+약 55%). 학습 결과(모델 성능)엔 영향 없는 순수 속도 최적화라 격리 검증 불필요. 진행 중이던 0724-0001 런에는 미적용(사용자 요청으로 중단하지 않고 그대로 완주시킴) — 다음 런부터 적용 |
 | 07-24 | **베이스라인 갱신: leverage 3 (0724-0001)** | 0722-0702(leverage=1) 대비 `--leverage 3`, `--explore-bonus-start 0.003`(비례 유지), `--workers 6`(quant_main 자원 경합 대응), liq_dist 관측 수정 반영. valid: BTC sel_monthly_log **+0.1889**(최초 확실한 양수), total_pnl +742.5, 승률 61.8%. test: sel_monthly_log -0.0537로 재하락(0722-0702 test -0.0430과 비슷한 수준)했으나 total_pnl(+572.8)·PF(1.49)·복리(152.48배)는 test에서도 베이스라인을 큰 폭으로 상회. MDD는 18.4%→55.9~62.8%로 악화 — 레버리지가 수익과 월별 변동성을 동시에 키운 것으로 해석. 신규 베이스라인으로 지정(5장) |
 | 07-24 | **rl 모드 CLI 기본값 갱신: `--leverage` 3.0, `--explore-bonus-start` 0.003** | 위 0724-0001 베이스라인 결과를 반영해, `--leverage`/`--explore-bonus-start` 미지정 시 rl 모드는 각각 3.0/0.003이 자동 적용되도록 변경(둘 다 `exit_mode`별 분기, adaptive는 기존값 유지·영향 없음 — 스모크 테스트로 양쪽 모드 확인). 다음 rl 모드 런부터는 옵션 없이 실행해도 이 값들이 기본 적용됨 |
+| 07-25 | **관측 20번칸(`upnl`) `entry_price_dist` 재설계 시도 → 재원복** | C그룹 재적용(×10, 이후 사용자가 기본 레버리지 3에 맞춰 ×33.3으로 재조정)했으나, leverage=3 재학습에서 청산 패턴(MSL=-100, near_liq_n 매 validation 1~2건)이 20M 스텝 넘게 지속 — ×33.3으로 스케일을 고쳐도 청산 빈도 자체는 줄지 않아 "관측 스케일이 원인"이라는 가설이 약해짐. `upnl_clip` 방식(클립 −1.5~3.0 → [-1,1] 재스케일)으로 원복, `max_win_multiple` 참고 지표도 같이 제거. 레버리지 3배 + rl 모드 자동 손절 부재가 관측 스케일링과 무관하게 근본 원인일 가능성이 새로운 유력 가설로 남음 — 미해결 |
+| 07-25 | **B그룹 적용: `ret15_atr_clip` 6.0→4.6, `ret1h_atr_clip` 12.0→7.4** | `V9 Design TODO - 입력벡터 구성 파라미터 개선.md` B그룹 — BTC p99 실측 기준 재보정(사용률 62%/50%→80%). ATR로 이미 정규화돼 있어 BTC/ETH/SOL 분포가 비슷해 트레이드오프 없는 순수 개선. `ret5_atr_clip`은 이미 79% 사용 중이라 미변경. 스모크 테스트 통과, 재학습 예정 |
+| 07-25 | **CPU Affinity (코어 바인딩) 최적화 도입 (`os.sched_setaffinity`)** | `train.py` 부모 프로세스와 `SubprocVecEnv` 워커 6개가 CPU 코어 바인딩 없이 실행되어 5초 간격으로 코어를 무작위 이동(Core Migration)하고 워커 간 코어가 중복 침범되어 컨텍스트 스위칭이 유발되던 현상 발굴. 부모 프로세스를 Core 0에 핀 지정하고 6개 워커를 Core 1~6에 1:1 전속 지정하는 `os.sched_setaffinity` 적용. 20초간 5초 간격 실측 모니터링 결과 코어 널뛰기 및 코어 침범/컨텍스트 스위칭 0건으로 완전 해소 검증 |
+| 07-25 | **B그룹 실측 결과 실패 → 원복, `ret5/ret15_atr_clip` 반대 방향(완화)으로 재시도** | 베이스라인(0724-0001, `ret15/ret1h_atr_clip` 원본값) 대비 MSL=-100 발생률이 4.0%(전부 3.0~5.5M 콜드스타트 초반)에서 23.2%(14M~34M까지 후반 재발)로 급증 확인 — "80% 사용률로 좁히면 트레이드오프 없다"는 전제가 깨짐: 위험 판단에 중요한 극단 구간 해상도를 좁혀서 오히려 잃음. `ret15/ret1h_atr_clip` 원본값(6.0/12.0)으로 원복. 이 실패를 반대로 해석해 `ret5_atr_clip` 3.0→4.7, `ret15_atr_clip` 6.0→7.4로 **완화**(ret1h와 동일하게 p99 사용률 ~50% 지점) 재시도 — 재학습 진행 중 |
+| 07-25 | **`max_upnl` 참고 지표 추가 (rl 모드 전용)** | `upnl_clip` 상한(현재 3.0) 재조정 근거 수집 목적. 거래 보유 중 매 분봉 관측된 미실현손익/증거금 배수의 피크값을 거래별로 기록(`env.py` `_open_position`/`_step_rl`/`_close_position`), 검증 1회당 전체 거래 중 최댓값을 `eval.py compute_metrics()`가 집계해 `valid/{SYM}/max_upnl`로 TB 기록. 모델 선택·보상엔 미관여, 순수 관측용. 스모크 테스트 통과(BTC 0.0526x, ETH 0.148x 정상 기록 확인) |
+| 07-25 | **`max_upnl_mult`→`max_upnl` 개명, `v9_score` 완전 폐기** | 사용자 지시로 진행. 필드명 단순화(변수/지표명이 "몇 배"라는 의미가 이미 명확해 `_mult` 접미사 불필요 판단). `v9_score`(`eval.py` 함수·`compute_metrics`/`fmt_metrics`/`acceptance` 필드·`--baseline-score` CLI·`train.py` TB 로깅·`min_v9_score` 전부)를 코드에서 완전 삭제 — 모델 선택은 이미 `sel_monthly_log` 단일 기준이라 v9_score는 TB 참고 기록 용도뿐이었음. 사전 확정 합격 기준 ④(v9_score≥베이스라인)도 함께 제거(위 5장 참고). 스모크 테스트 통과 |
+| 07-25 | **`train.py`/`eval.py` `--exit-mode` 기본값 `adaptive`→`rl`** | 사용자 지시로 진행(테스트 생략). rl 모드가 이번 세션 전반의 실험 주력이 된 실태를 CLI 기본값에도 반영 — `--exit-mode` 미지정 시 이제 rl로 실행됨. adaptive/rule은 여전히 지원되나 레거시로 재분류(1장 개요, 3장 표 갱신) |
 
 ---
 
@@ -307,5 +322,5 @@ m_i = ∏(1 + pnl/100)          # 달력 월 i의 거래들, 월초 자본 1.0 �
 - 런 이름: `v9_{ppo|fullctrl}_seed{S}_{MMDD-HHMM}` — **시작 시각(KST, 2026-07-20부터) 포함 유니크 (2026-07-19 도입)**. 이전의 `v9_ppo_seed{S}` 고정 이름은 재시작 시 TB 런 디렉토리·체크포인트가 이전 런 산출물을 덮어쓰는 사고가 있어 폐기. 접두사는 exit_mode가 rl이면 `v9_fullctrl_`(보유 중 풀 컨트롤), 그 외(adaptive/rule)는 `v9_ppo_`(기존 관례 유지) — **세 모드 전부 알고리즘은 PPO로 동일**하고 태그는 환경 모드(exit_mode) 구분용일 뿐이라, 태그를 "rl"로 하면 "ppo" 옆에 나란히 놓였을 때 서로 다른 알고리즘처럼 오인되어 fullctrl로 명명 (2026-07-20). TB 로그 디렉토리는 run_name 그대로 남고 SB3의 자동 run-id 접미사(`_1`)는 커스텀 로거로 억제함(2026-07-20, 이미 타임스탬프로 유니크라 불필요).
 - 모델/로그 저장 경로는 **exit_mode별 폴더로 분리** (2026-07-20, `train.mode_subdir()`): rl은 `v9_fullctrl/`, adaptive/rule은 `v9_adaptive_ppo/`(기존 `v9_ppo_` 파일명 접두사 공유 관례를 폴더 단위로 계승). 세 모드 다 알고리즘은 PPO로 동일 — "fullctrl"은 rl 모드(보유 중 풀 컨트롤)를 "ppo" 옆에 나란히 둘 때 다른 알고리즘처럼 오인되지 않도록 붙인 이름.
 - 모델: `models/{mode_subdir}/{run_name}_{steps}_steps.zip` (주기 체크포인트), `..._best.zip` + `..._best_info.json` (검증 best), `..._final.zip` (학습 종료 시점)
-- 로그: `logs/{mode_subdir}/{run_name}/` (TensorBoard — `valid/{SYMBOL}/...` 지표군, `valid/BTC-USDT-SWAP/sel_monthly_log`가 모델 선택 점수 — 2026-07-20부터, 구 태그명 `v9_score_sel` 폐기). SB3의 자동 run-id 접미사(`_1`)는 커스텀 로거로 억제(2026-07-20). 폐기 런은 `logs_discarded/`(logs/ 밖 별도 최상위 디렉토리)로 이동, 보존 가치가 있으면 구분되는 이름으로 해당 모드 폴더에 유지.
+- 로그: `logs/{mode_subdir}/{run_name}/` (TensorBoard — `valid/{SYMBOL}/...` 지표군, `valid/BTC-USDT-SWAP/sel_monthly_log`가 모델 선택 점수 — 2026-07-20부터, 구 태그명 `v9_score_sel` 폐기; `v9_score` 자체도 2026-07-25 완전 폐기). SB3의 자동 run-id 접미사(`_1`)는 커스텀 로거로 억제(2026-07-20). 폐기 런은 `logs_discarded/`(logs/ 밖 별도 최상위 디렉토리)로 이동, 보존 가치가 있으면 구분되는 이름으로 해당 모드 폴더에 유지.
 - 2026-07-20: 기존에 평탄하게 쌓여있던 모델/로그(전부 adaptive 히스토리)를 전부 `v9_adaptive_ppo/`로 일괄 이관 완료 — `models/v9_adaptive_ppo/archive_60d_run/`, `.../backup_run3/`처럼 기존 특수 목적 하위 폴더는 그 안에 중첩 보존.

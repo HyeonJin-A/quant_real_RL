@@ -89,8 +89,8 @@ NORM = {
     # 타이밍 피처: 수익률을 ATR%로 나눈 "몇 ATR만큼 움직였나" 단위의 클립 상한 (2026-07-20).
     # 원시 %는 종목/레짐 간 변동성 차이로 비교 불가라 ATR 정규화 채택 — 조용한 장의 -0.3%와
     # 폭발장의 -0.3%를 구분. 상수는 v9b 분포 리포트(BTC/ETH p1~p99 커버)로 검증 후 확정.
-    "ret5_atr_clip": 3.0,
-    "ret15_atr_clip": 6.0,
+    "ret5_atr_clip": 4.7,
+    "ret15_atr_clip": 7.4,
     "ret1h_atr_clip": 12.0,
 }
 
@@ -124,7 +124,8 @@ TP_FULL_EXTRA_RANGE = (0.0, 2.0)    # 완익절레벨 = 반익절레벨 + 이 �
 # 2026-07-19: +보상 클리핑(REWARD_CLIP_USDT=30) 제거. 50M×2시드 실측 결과 이 전략의 수익 원천인
 # "소수의 큰 익절(+100~170)"의 유인을 클립이 정확히 제거해버려서, 정책이 TP를 짧게 당기는
 # (승률 26→35%) 대신 수수료+소손실을 못 이기는 음의 기대값으로 적응함. top1 의존 억제는
-# 보상이 아니라 모델 선택 기준(eval_v9.v9_score의 top1 제외 항)이 담당한다.
+# 보상이 아니라 모델 선택 기준(합격 기준 ③, top1 제외 후 흑자 판정)이 담당한다.
+# (2026-07-25: 당시 이 역할이던 v9_score 지표 자체는 이후 폐기됨)
 # 2026-07-19: 근접청산(pnl≤-95) 추가 감점(-100)도 제거 — 손실 예산 기반 레버리지 상한
 # (MAX_TRADE_LOSS_PCT=20)이 -95 도달 자체를 구조적으로 불가능하게 만들어 죽은 코드가 됨.
 # 근접청산 억제는 사후 벌점(보상/점수)이 아니라 사전 차단(상한 공식)으로 일원화.
@@ -534,6 +535,7 @@ class TradingEnvV9(gym.Env):
         self.entry_price = price
         self.pos_size = MARGIN_USDT * self.leverage / price
         self.entry_ts = int(self.ts_ms[i])
+        self._trade_peak_upnl = 0.0  # 2026-07-25: upnl_clip 상한 재검토용 참고 지표 (거래 중 관측 최대 upnl/증거금 배수)
         self.cum_pnl -= self.pos_size * price * self.fee_rate  # 진입 수수료 즉시 차감
         f = self.fee_rate
         inv_lev = 1.0 / self.leverage
@@ -548,6 +550,9 @@ class TradingEnvV9(gym.Env):
         fees = self.pos_size * (self.entry_price + price) * self.fee_rate
         net = gross - fees
         self.cum_pnl += gross - self.pos_size * price * self.fee_rate  # 진입 수수료는 이미 차감됨
+        # 청산가 자체도 후보에 포함 (강제청산/마지막 홀드 봉에서만 갱신되던 값이 아니라
+        # 실제 청산 체결가 기준 upnl까지 반영)
+        peak_upnl = max(self._trade_peak_upnl, self._unrealized(price) / MARGIN_USDT)
         self.trades.append({
             "entry_ts": self.entry_ts,
             "exit_ts": int(ts_ms),
@@ -556,6 +561,7 @@ class TradingEnvV9(gym.Env):
             "exit_price": float(price),
             "pnl": float(net),
             "reason": reason,
+            "max_upnl": float(peak_upnl),
         })
         self.pos_dir = 0
         self.pos_size = 0.0
@@ -574,6 +580,7 @@ class TradingEnvV9(gym.Env):
         self.liq_price = 0.0
         self.cum_pnl = 0.0
         self._equity_prev = 0.0
+        self._trade_peak_upnl = 0.0
         self.trades = []
 
     def reset(self, *, seed=None, options=None):
@@ -740,6 +747,9 @@ class TradingEnvV9(gym.Env):
         nxt = min(i + self.decision_stride, hard_end)
         for j in range(i + 1, nxt + 1):
             if self.pos_dir != 0:
+                self._trade_peak_upnl = max(
+                    self._trade_peak_upnl, self._unrealized(self.closes[j]) / MARGIN_USDT
+                )
                 if self.pos_dir > 0 and self.lows[j] <= self.liq_price:
                     self._close_position(self.liq_price, self.ts_ms[j], "liquidation")
                 elif self.pos_dir < 0 and self.highs[j] >= self.liq_price:

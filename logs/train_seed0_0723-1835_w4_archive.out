@@ -1,0 +1,209 @@
+run_name: v9_fullctrl_seed0_0723-1835
+Using cpu device
+Logging to /home/henjigcp/git/quant_real_RL/logs/v9_fullctrl/v9_fullctrl_seed0_0723-1835
+-----------------------------
+| time/              |      |
+|    fps             | 3498 |
+|    iterations      | 1    |
+|    time_elapsed    | 2    |
+|    total_timesteps | 8192 |
+-----------------------------
+-----------------------------------------
+| time/                   |             |
+|    fps                  | 3100        |
+|    iterations           | 2           |
+|    time_elapsed         | 5           |
+|    total_timesteps      | 16384       |
+| train/                  |             |
+|    approx_kl            | 0.011759704 |
+|    clip_fraction        | 0.0758      |
+|    clip_range           | 0.2         |
+|    entropy_loss         | -1.09       |
+|    explained_variance   | -0.81       |
+|    learning_rate        | 0.0003      |
+|    loss                 | -0.0181     |
+|    n_updates            | 10          |
+|    policy_gradient_loss | -0.00545    |
+|    value_loss           | 0.00669     |
+-----------------------------------------
+------------------------------------------
+| time/                   |              |
+|    fps                  | 2866         |
+|    iterations           | 3            |
+|    time_elapsed         | 8            |
+|    total_timesteps      | 24576        |
+| train/                  |              |
+|    approx_kl            | 0.0071404856 |
+|    clip_fraction        | 0.0245       |
+|    clip_range           | 0.2          |
+|    entropy_loss         | -1.09        |
+|    explained_variance   | 0.536        |
+|    learning_rate        | 0.0003       |
+|    loss                 | -0.0206      |
+|    n_updates            | 20           |
+|    policy_gradient_loss | -0.00176     |
+|    value_loss           | 0.00121      |
+------------------------------------------
+-----------------------------------------
+| time/                   |             |
+|    fps                  | 2761        |
+|    iterations           | 4           |
+|    time_elapsed         | 11          |
+|    total_timesteps      | 32768       |
+| train/                  |             |
+|    approx_kl            | 0.006015873 |
+|    clip_fraction        | 0.0196      |
+|    clip_range           | 0.2         |
+|    entropy_loss         | -1.09       |
+|    explained_variance   | 0.627       |
+|    learning_rate        | 0.0003      |
+|    loss                 | -0.0175     |
+|    n_updates            | 30          |
+|    policy_gradient_loss | -0.00269    |
+|    value_loss           | 0.000986    |
+-----------------------------------------
+------------------------------------------
+| time/                   |              |
+|    fps                  | 2734         |
+|    iterations           | 5            |
+|    time_elapsed         | 14           |
+|    total_timesteps      | 40960        |
+| train/                  |              |
+|    approx_kl            | 0.0092358515 |
+|    clip_fraction        | 0.0225       |
+|    clip_range           | 0.2          |
+|    entropy_loss         | -1.07        |
+|    explained_variance   | 0.23         |
+|    learning_rate        | 0.0003       |
+|    loss                 | -0.0123      |
+|    n_updates            | 40           |
+|    policy_gradient_loss | -0.00286     |
+|    value_loss           | 0.000501     |
+------------------------------------------
+------------------------------------------
+| time/                   |              |
+|    fps                  | 2703         |
+|    iterations           | 6            |
+|    time_elapsed         | 18           |
+|    total_timesteps      | 49152        |
+| train/                  |              |
+|    approx_kl            | 0.0061667506 |
+|    clip_fraction        | 0.0129       |
+|    clip_range           | 0.2          |
+|    entropy_loss         | -1.05        |
+|    explained_variance   | 0.566        |
+|    learning_rate        | 0.0003       |
+|    loss                 | -0.0121      |
+|    n_updates            | 50           |
+|    policy_gradient_loss | -0.00237     |
+|    value_loss           | 0.000178     |
+------------------------------------------
+-----------------------------------------
+| time/                   |             |
+|    fps                  | 2672        |
+|    iterations           | 7           |
+|    time_elapsed         | 21          |
+|    total_timesteps      | 57344       |
+| train/                  |             |
+|    approx_kl            | 0.007976414 |
+|    clip_fraction        | 0.0295      |
+|    clip_range           | 0.2         |
+|    entropy_loss         | -1.03       |
+|    explained_variance   | 0.362       |
+|    learning_rate        | 0.0003      |
+|    loss                 | -0.0208     |
+|    n_updates            | 60          |
+|    policy_gradient_loss | -0.00319    |
+|    value_loss           | 0.00011     |
+-----------------------------------------
+-----------------------------------------
+| time/                   |             |
+|    fps                  | 2678        |
+|    iterations           | 8           |
+|    time_elapsed         | 24          |
+|    total_timesteps      | 65536       |
+| train/                  |             |
+|    approx_kl            | 0.005590006 |
+|    clip_fraction        | 0.019       |
+|    clip_range           | 0.2         |
+|    entropy_loss         | -1.03       |
+|    explained_variance   | 0.488       |
+|    learning_rate        | 0.0003      |
+|    loss                 | -0.00787    |
+|    n_updates            | 70          |
+|    policy_gradient_loss | -0.00247    |
+|    value_loss           | 8.15e-05    |
+-----------------------------------------
+------------------------------------------
+| time/                   |              |
+|    fps                  | 2702         |
+|    iterations           | 9            |
+|    time_elapsed         | 27           |
+|    total_timesteps      | 73728        |
+| train/                  |              |
+|    approx_kl            | 0.0059496732 |
+|    clip_fraction        | 0.0205       |
+|    clip_range           | 0.2          |
+|    entropy_loss         | -1.03        |
+|    explained_variance   | 0.486        |
+|    learning_rate        | 0.0003       |
+|    loss                 | -0.016       |
+|    n_updates            | 80           |
+|    policy_gradient_loss | -0.00289     |
+|    value_loss           | 6.63e-05     |
+------------------------------------------
+-----------------------------------------
+| time/                   |             |
+|    fps                  | 2723        |
+|    iterations           | 10          |
+|    time_elapsed         | 30          |
+|    total_timesteps      | 81920       |
+| train/                  |             |
+|    approx_kl            | 0.008008016 |
+|    clip_fraction        | 0.024       |
+|    clip_range           | 0.2         |
+|    entropy_loss         | -1.03       |
+|    explained_variance   | 0.434       |
+|    learning_rate        | 0.0003      |
+|    loss                 | -0.0151     |
+|    n_updates            | 90          |
+|    policy_gradient_loss | -0.00326    |
+|    value_loss           | 7.93e-05    |
+-----------------------------------------
+-----------------------------------------
+| time/                   |             |
+|    fps                  | 2739        |
+|    iterations           | 11          |
+|    time_elapsed         | 32          |
+|    total_timesteps      | 90112       |
+| train/                  |             |
+|    approx_kl            | 0.008297166 |
+|    clip_fraction        | 0.0264      |
+|    clip_range           | 0.2         |
+|    entropy_loss         | -1.02       |
+|    explained_variance   | 0.535       |
+|    learning_rate        | 0.0003      |
+|    loss                 | -0.0203     |
+|    n_updates            | 100         |
+|    policy_gradient_loss | -0.00325    |
+|    value_loss           | 7.1e-05     |
+-----------------------------------------
+Process SpawnProcess-4:
+Traceback (most recent call last):
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/home/henjigcp/git/quant_real_RL/venv/lib/python3.12/site-packages/stable_baselines3/common/vec_env/subproc_vec_env.py", line 33, in _worker
+    cmd, data = remote.recv()
+                ^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/multiprocessing/connection.py", line 250, in recv
+    buf = self._recv_bytes()
+          ^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/multiprocessing/connection.py", line 430, in _recv_bytes
+    buf = self._recv(4)
+          ^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/multiprocessing/connection.py", line 395, in _recv
+    chunk = read(handle, remaining)
+            ^^^^^^^^^^^^^^^^^^^^^^^
+ConnectionResetError: [Errno 104] Connection reset by peer
