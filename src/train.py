@@ -261,7 +261,11 @@ def build_callbacks(args, cache_paths, bounds, run_name, env_kwargs):
                     btc_sel, btc_logs_m = monthly_sel_score(trades, int(ts[lo]), int(ts[hi - 1]))
                     # "무거래 = 월배수 1.0 = 중립"이 손실 정책보다 우대되는 함정 차단:
                     # 월평균 거래수 미달이면 best 후보 자격 자체를 박탈 (합격 기준 ①과 동일 문턱)
-                    btc_eligible = m["trades_per_month"] >= MIN_TRADES_PER_MONTH
+                    # 근접청산 건수(near_liq_n)가 0이 아니면 자격 박탈 (2026-07-26 추가):
+                    # sel_monthly_log만으로는 근접청산 위험을 감점만 할 뿐 걸러내지 못해,
+                    # 월별 변동성이 우연히 낮게 나온 위험한 체크포인트가 best로 뽑힐 수 있음.
+                    btc_eligible = (m["trades_per_month"] >= MIN_TRADES_PER_MONTH
+                                     and m["near_liq_n"] == 0)
                 if self.verbose:
                     print(f"[valid @{self.num_timesteps:,}] {sym}: "
                           f"trades={m['trades']} pnl={m['total_pnl']:+.1f}")
@@ -317,8 +321,8 @@ def main():
                         help="배포 전 최종학습용 95/5(train/valid) 분할 사용 (기본은 개발용 70/15/15). "
                              "이어학습이 아니라 처음부터 새로 학습해야 함 — 기존 체크포인트는 lr/ent_coef/"
                              "explore_bonus 스케줄이 이미 소진돼 있어 이어붙여도 사실상 안 배움 (2026-07-23)")
-    parser.add_argument("--timesteps", type=int, default=50_000_000)
-    parser.add_argument("--workers", type=int, default=6)
+    parser.add_argument("--timesteps", type=int, default=100_000_000)
+    parser.add_argument("--workers", type=int, default=14)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--n-steps", type=int, default=2048, help="PPO 롤아웃 버퍼 크기")

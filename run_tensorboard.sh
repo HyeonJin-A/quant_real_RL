@@ -15,9 +15,9 @@ pkill -f "tensorboard --logdir" 2>/dev/null || true
 pkill -f "cloudflared tunnel" 2>/dev/null || true
 sleep 1
 
-nohup venv/bin/tensorboard --logdir logs --port "$PORT" --host 127.0.0.1 \
+nohup taskset -c 15 venv/bin/tensorboard --logdir logs --port "$PORT" --host 127.0.0.1 \
     > logs/tensorboard.out 2>&1 &
-nohup "$CLOUDFLARED" tunnel --url "http://localhost:$PORT" --no-autoupdate \
+nohup taskset -c 15 "$CLOUDFLARED" tunnel --url "http://localhost:$PORT" --no-autoupdate \
     > logs/cloudflared.out 2>&1 &
 
 echo "Cloudflare 터널 URL 발급 대기 중..."
