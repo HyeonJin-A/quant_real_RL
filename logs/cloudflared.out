@@ -46,3 +46,4 @@
 2026-07-26T04:50:44Z ERR Request failed error="Incoming request ended abruptly: context canceled" connIndex=0 dest=https://alfred-scientist-tract-determined.trycloudflare.com/experiment/defaultExperimentId/data/plugin/timeseries/timeSeries event=0 ip=198.41.200.193 type=http
 2026-07-26T04:50:44Z ERR  error="Incoming request ended abruptly: context canceled" connIndex=0 event=1 ingressRule=0 originService=http://localhost:6006
 2026-07-26T04:50:44Z ERR Request failed error="Incoming request ended abruptly: context canceled" connIndex=0 dest=https://alfred-scientist-tract-determined.trycloudflare.com/experiment/defaultExperimentId/data/plugin/timeseries/timeSeries event=0 ip=198.41.200.193 type=http
+2026-07-27T03:36:41Z WRN Your version 2026.7.2 is outdated. We recommend upgrading it to 2026.7.3

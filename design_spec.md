@@ -308,6 +308,7 @@ m_i = ∏(1 + pnl/100)          # 달력 월 i의 거래들, 월초 자본 1.0 �
 | 07-25 | **`max_upnl_mult`→`max_upnl` 개명, `v9_score` 완전 폐기** | 사용자 지시로 진행. 필드명 단순화(변수/지표명이 "몇 배"라는 의미가 이미 명확해 `_mult` 접미사 불필요 판단). `v9_score`(`eval.py` 함수·`compute_metrics`/`fmt_metrics`/`acceptance` 필드·`--baseline-score` CLI·`train.py` TB 로깅·`min_v9_score` 전부)를 코드에서 완전 삭제 — 모델 선택은 이미 `sel_monthly_log` 단일 기준이라 v9_score는 TB 참고 기록 용도뿐이었음. 사전 확정 합격 기준 ④(v9_score≥베이스라인)도 함께 제거(위 5장 참고). 스모크 테스트 통과 |
 | 07-25 | **`train.py`/`eval.py` `--exit-mode` 기본값 `adaptive`→`rl`** | 사용자 지시로 진행(테스트 생략). rl 모드가 이번 세션 전반의 실험 주력이 된 실태를 CLI 기본값에도 반영 — `--exit-mode` 미지정 시 이제 rl로 실행됨. adaptive/rule은 여전히 지원되나 레거시로 재분류(1장 개요, 3장 표 갱신) |
 | 07-26 | **모델 선택에 근접청산(`near_liq_n`) 하드 게이트 추가** | 사용자 지시로 진행. `ValidationCallback`의 `btc_eligible` 조건에 `m["near_liq_n"] == 0`을 추가(기존 월평균 거래수 조건과 AND) — `sel_monthly_log`가 근접청산 위험을 직접 반영하지 않아, 월별 변동성이 우연히 낮게 나온 위험한 체크포인트가 best로 선택될 여지를 하드 게이트로 차단 (5장 가드2) |
+| 07-27 | **(진단용, 임시) `DEBUG_DUMP_TRADES` 디버그 덤프 추가 → 원인 미확정으로 보류, 덤프+코드 제거** | `leverage=5` 런(0726-1719)에서 `sel_monthly_log` 학습중 기록값(best_info.json/TB)과 동일 체크포인트를 `eval.py`로 재로드해 재평가한 값이 반복적으로 부호까지 반대로 나오는 이슈 발견(예: 94.5M 지점 학습중 +0.8038 vs 재평가 -0.3499). 정적 코드 리뷰로는 원인 미발견 — `ValidationCallback`에 BTC 검증마다 그 순간의 trades+모델을 파일 덤프하는 임시 코드 추가(`DEBUG_DUMP_TRADES=1`일 때만 활성화). `leverage=10` 런(0727-0934, 초반/중반+0.65/후반-0.56 등 4개 지점 교차검증)에서는 라이브 기록값과 재로드 재평가값이 거래건수까지 정확히 일치 — 코드 자체의 일반적 버그는 아니고 leverage=5 런의 특정 체크포인트(들)에서만 발생한 일회성 이상 현상으로 잠정 결론. 원인 미확정 상태로 재발 시까지 보류하기로 하고, 디버그 덤프 파일(603개, 128MB) 삭제 + `ValidationCallback`의 덤프 코드 제거 완료 (재발 시 다시 추가) |
 
 ---
 
@@ -317,6 +318,7 @@ m_i = ∏(1 + pnl/100)          # 달력 월 i의 거래들, 월초 자본 1.0 �
 - **BTC/ETH 성과 괴리** (`V9 Issue - BTC,ETH괴리잡기.md`, 부분 대응): 동적 레버리지 상한으로 근접청산 격차는 구조적으로 해소했으나, ETH 자체의 수익성 문제는 미해결 — 모델 선택을 BTC 단독으로 돌린 것이 그 방증. ETH는 현재 지표 관찰만 유지.
 - **rl 모드 action masking 미도입** (`V9 Design TODO - Action Masking.md`, 설계 단계·미구현): 상태에 안 맞는 행동(무포지션+Close, 보유중+Enter)이 지금은 조용히 Hold로 흡수돼, entropy_loss가 실제 행동 다양성과 어긋날 수 있고 행동공간 일부가 항상 낭비됨. `sb3-contrib`의 `MaskablePPO` 도입이 후보안 — 우선순위는 낮음(현재 진행 중인 leverage/explore_bonus 실험이 안정화된 뒤 착수 권장, 변수 동시 변경은 원인 격리를 어렵게 만든다는 게 이번 세션 반복 교훈).
 - **입력벡터 정규화 상한 재검토** (`V9 Design TODO - 입력벡터 구성 파라미터 상한 개선.md`, 분석 완료·미적용): `NORM` 딕셔너리 상수 대부분이 실측 분포 대비 너무 느슨하게(BTC p99 기준 28~46%만 사용) 잡혀있어 관측 해상도가 낭비됨 — `wave_scale_max`/`atr_pct_max`/`duration_log_max`/`div_gap_max`(심볼 편차 있음)와 `ret15/1h_atr_clip`(심볼 편차 적음)이 대상. `liq_dist`(관측 22번칸)는 이미 별도로 수정·적용됨(2026-07-24). `upnl_clip`은 leverage 의존적이라 별도 계측 필요.
+- **`sel_monthly_log` 학습중 기록값 vs `eval.py` 재로드 재평가값 불일치 (원인 미확정, 재현 안 됨)**: `leverage=5` 런(0726-1719)에서 1~2회 관측(80M/94.5M 지점, 부호까지 반대). 동일 조건의 `leverage=10` 런(0727-0934)에서 4개 지점 교차검증 시엔 재현 안 됨(6장 07-27 항목 참고) — 일회성 이상 현상으로 잠정 결론, 재발 시 조치. 진단용 `DEBUG_DUMP_TRADES` 덤프 코드는 재현 안 됨을 확인한 뒤 제거함(재발 시 다시 추가해 조사).
 
 ---
 
