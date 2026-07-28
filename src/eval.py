@@ -71,13 +71,97 @@ def split_bounds(cache_paths, final=False):
     return bounds
 
 
-def run_policy_on_range(model, cache_path, lo, hi, n_segments=1, decision_stride=1, fee_rate=0.0005,
-                        exit_mode="rule", sl_multiplier=None, tp_half_level=None,
-                        be_trigger_level=None, max_hold_bars=None, leverage=None, leverage_max=None):
+# 2026-07-28: 검증/평가 롤아웃 속도 최적화 (`검증 롤아웃 속도 최적화.md`).
+# 실측(BTC valid 518,021행, torch 1스레드): model.predict() 124.8µs/step vs env.step() 1.4µs/step
+# — 검증 시간의 98%가 "실제 연산"이 아니라 torch 호출 오버헤드(텐서 변환→디스패치→결과 반환)였음.
+# [64,64] 초소형 MLP라 행렬 연산 자체는 마이크로초인데 프레임워크 왕복이 그 수십 배.
+# torch predict는 batch=1/2/4가 119.5/129.5/124.6µs로 거의 평평 = 순수 고정 오버헤드라는 증거.
+MASK_HUGE_NEG = np.float32(-1e8)  # sb3_contrib MaskableCategorical.apply_masking과 동일 상수
+
+
+class NumpyDiscretePolicy:
+    """검증/평가 롤아웃 전용 numpy 추론 래퍼 (Discrete 액션 + deterministic 전용).
+
+    `model.predict(obs, deterministic=True[, action_masks=...])`와 동일한 시그니처/결과를
+    제공하되 torch 호출 오버헤드를 제거한다(실측 124.8µs → 7.2µs, 약 17배).
+    정책망이 Linear→Tanh→Linear→Tanh→action_net(Linear)뿐이라 numpy 3줄로 동일 연산이 되고,
+    평가는 항상 deterministic=True(argmax)라 샘플링 경로도 불필요.
+
+    ⚠️ 학습 중 검증이면 매 검증마다 새로 생성해야 한다 (정책 가중치가 계속 바뀌므로).
+    구조가 조금이라도 다르면 절대 쓰지 말 것 — 생성은 `numpy_policy_if_supported()`로만.
     """
-    [lo, hi) 구간을 시간순으로 롤아웃. 기본 n_segments=1 = 세그먼트 분할 없음 (2026-07-19:
-    16분할 병렬은 경계 강제정산 + 재수렴 구간 때문에 거래수 ~8%/pnl ~12% 오차가 실측돼 폐기 —
-    실전과 완벽히 동일한 단일 연속 롤아웃이 기본). n_segments>1은 빠른 근사가 필요할 때만.
+
+    def __init__(self, sb3_model):
+        sd = {k: v.detach().cpu().numpy().astype(np.float32)
+              for k, v in sb3_model.policy.state_dict().items()}
+        # torch nn.Linear는 x @ W.T + b — 전치는 여기서 1회만 수행
+        self.w = [sd["mlp_extractor.policy_net.0.weight"].T.copy(),
+                  sd["mlp_extractor.policy_net.2.weight"].T.copy(),
+                  sd["action_net.weight"].T.copy()]
+        self.b = [sd["mlp_extractor.policy_net.0.bias"],
+                  sd["mlp_extractor.policy_net.2.bias"],
+                  sd["action_net.bias"]]
+
+    def predict(self, obs_batch, deterministic=True, action_masks=None):
+        if not deterministic:
+            raise NotImplementedError("deterministic=True 전용 (평가 경로만 사용)")
+        x = np.asarray(obs_batch, dtype=np.float32)
+        x = np.tanh(x @ self.w[0] + self.b[0])
+        x = np.tanh(x @ self.w[1] + self.b[1])
+        logits = x @ self.w[2] + self.b[2]
+        if action_masks is not None:
+            # MaskableCategorical.apply_masking과 동일: 무효 행동 로짓을 -1e8로 치환.
+            # sb3_contrib는 argmax(softmax(logits))를 쓰지만 softmax는 단조라 argmax는 동일.
+            logits = np.where(action_masks, logits, MASK_HUGE_NEG)
+        return np.argmax(logits, axis=-1), None
+
+
+def numpy_policy_if_supported(model):
+    """정책이 numpy로 정확히 재현 가능한 구조일 때만 NumpyDiscretePolicy를 반환, 아니면 None.
+
+    None이면 호출부가 기존 torch `model.predict`로 폴백하므로 동작이 100% 불변이다.
+    - adaptive 모드(Box 연속 액션, 가우시안 평균+클리핑)는 재현 대상에서 제외 → 항상 폴백
+    - net_arch/활성함수가 [64,64]+Tanh가 아니거나 features_extractor에 학습 파라미터가
+      있으면(예: 향후 CNN/정규화 래퍼 도입) 즉시 폴백 — 조용히 틀린 결과를 내는 것 방지
+    """
+    try:
+        import torch.nn as nn
+        from gymnasium import spaces
+        policy = model.policy
+        if not isinstance(policy.action_space, spaces.Discrete):
+            return None
+        net = policy.mlp_extractor.policy_net
+        if len(net) != 4 or not all(isinstance(net[i], t) for i, t in
+                                    ((0, nn.Linear), (1, nn.Tanh), (2, nn.Linear), (3, nn.Tanh))):
+            return None
+        if not isinstance(policy.action_net, nn.Linear):
+            return None
+        if sum(p.numel() for p in policy.features_extractor.parameters()) != 0:
+            return None
+        return NumpyDiscretePolicy(model)
+    except Exception:
+        return None
+
+
+def run_policy_on_ranges(model, targets, n_segments=1, decision_stride=1, fee_rate=0.0005,
+                         exit_mode="rule", sl_multiplier=None, tp_half_level=None,
+                         be_trigger_level=None, max_hold_bars=None, leverage=None,
+                         leverage_max=None, use_numpy_policy=True):
+    """여러 독립 레인(심볼)을 한 배치로 동시 롤아웃. targets: [(key, cache_path, lo, hi), ...]
+    → {key: trades}
+
+    각 레인은 여전히 자기 구간 전체를 1행씩 순차로 걷는다(실전과 동일한 단일 연속 롤아웃
+    성질 보존). 바뀌는 것은 "한 번의 predict() 호출에 여러 심볼의 관측을 함께 넣는다"는 점뿐 —
+    심볼끼리는 완전히 독립된 레인이라(BTC의 t시점 결정은 ETH 상태를 전혀 보지 않고, 상태 전이도
+    자기 데이터에만 의존) 함께 추론하든 따로 하든 각 레인이 보는 정보·순서·결과가 동일하다.
+    torch 호출 오버헤드가 배치 크기와 무관하게 고정이라, 심볼 2개면 호출 횟수가 절반이 된다.
+
+    🚨 시간축 분할(n_segments>1)과 절대 혼동 금지 — 독립 레인 배치는 시간축을 안 건드려
+    안전하지만, 한 심볼을 N토막 내는 것은 인위적 경계 강제정산 + 재수렴 구간이 생겨 결과가
+    달라진다(2026-07-19 실측: 16분할에서 거래수 ~8%/pnl ~12% 오차, 폐기됨). n_segments는
+    기존 인터페이스 호환용으로만 남겨두며 기본값 1(분할 없음)을 유지할 것.
+
+    use_numpy_policy=False면 torch `model.predict` 경로를 강제한다 (A/B/C 파리티 검증용).
 
     leverage: rule/rl 모드 전용 고정 레버리지. leverage_max: adaptive 모드 전용 레버리지 상한
     (학습 때 --leverage로 고정 상한 베이스라인을 구성했다면 평가도 반드시 동일 값을 지정할 것
@@ -91,21 +175,37 @@ def run_policy_on_range(model, cache_path, lo, hi, n_segments=1, decision_stride
         if val is not None:
             env_kwargs[key] = val
 
-    n_segments = max(1, min(n_segments, (hi - lo) // 1000 or 1))
-    edges = np.linspace(lo, hi, n_segments + 1, dtype=np.int64)
-    envs = []
-    for k in range(n_segments):
-        if edges[k + 1] - edges[k] < 100:
+    lane_keys, envs = [], []
+    for key, cache_path, lo, hi in targets:
+        if hi - lo < 100:
             continue
-        env = TradingEnvV9(cache_path, start_idx=int(edges[k]), end_idx=int(edges[k + 1]), **env_kwargs)
-        envs.append(env)
+        ns = max(1, min(n_segments, (hi - lo) // 1000 or 1))
+        edges = np.linspace(lo, hi, ns + 1, dtype=np.int64)
+        for k in range(ns):
+            if edges[k + 1] - edges[k] < 100:
+                continue
+            envs.append(TradingEnvV9(cache_path, start_idx=int(edges[k]),
+                                     end_idx=int(edges[k + 1]), **env_kwargs))
+            lane_keys.append(key)
+
+    # 2026-07-27: rl 모드 action masking(MaskablePPO) 지원 — 상태에 안 맞는 행동을
+    # 물리적으로 제거한 채 학습됐으므로, 추론 시에도 동일하게 마스킹해야 학습 때와
+    # 같은 유효 행동 후보로 argmax를 계산함 (`V9 Design TODO - Action Masking.md`).
+    from sb3_contrib import MaskablePPO
+    use_masking = isinstance(model, MaskablePPO)
+    npolicy = numpy_policy_if_supported(model) if use_numpy_policy else None
+    predictor = npolicy if npolicy is not None else model
 
     obs_list = [env.reset(seed=0)[0] for env in envs]
     done = [False] * len(envs)
     while not all(done):
         active = [k for k, d in enumerate(done) if not d]
         obs_batch = np.stack([obs_list[k] for k in active])
-        actions, _ = model.predict(obs_batch, deterministic=True)
+        if use_masking:
+            mask_batch = np.stack([envs[k].action_masks() for k in active])
+            actions, _ = predictor.predict(obs_batch, deterministic=True, action_masks=mask_batch)
+        else:
+            actions, _ = predictor.predict(obs_batch, deterministic=True)
         for a_idx, k in enumerate(active):
             # Discrete(rl/rule)면 스칼라, Box(adaptive)면 6차원 배열 — 둘 다 그대로 전달
             obs, _, _, truncated, _ = envs[k].step(actions[a_idx])
@@ -113,11 +213,31 @@ def run_policy_on_range(model, cache_path, lo, hi, n_segments=1, decision_stride
             if truncated:
                 done[k] = True
 
-    trades = []
-    for env in envs:
-        trades.extend(env.trades)
-    trades.sort(key=lambda t: t["entry_ts"])
-    return trades
+    out = {key: [] for key, _, _, _ in targets}
+    for key, env in zip(lane_keys, envs):
+        out[key].extend(env.trades)
+    for key in out:
+        out[key].sort(key=lambda t: t["entry_ts"])
+    return out
+
+
+def run_policy_on_range(model, cache_path, lo, hi, n_segments=1, decision_stride=1, fee_rate=0.0005,
+                        exit_mode="rule", sl_multiplier=None, tp_half_level=None,
+                        be_trigger_level=None, max_hold_bars=None, leverage=None, leverage_max=None,
+                        use_numpy_policy=True):
+    """단일 구간 롤아웃 — `run_policy_on_ranges`(복수형)의 1개 타깃 래퍼(기존 시그니처 유지).
+
+    기본 n_segments=1 = 세그먼트 분할 없음 (2026-07-19: 16분할 병렬은 경계 강제정산 + 재수렴
+    구간 때문에 거래수 ~8%/pnl ~12% 오차가 실측돼 폐기 — 실전과 완벽히 동일한 단일 연속
+    롤아웃이 기본). n_segments>1은 빠른 근사가 필요할 때만.
+    """
+    return run_policy_on_ranges(
+        model, [(0, cache_path, lo, hi)], n_segments=n_segments,
+        decision_stride=decision_stride, fee_rate=fee_rate, exit_mode=exit_mode,
+        sl_multiplier=sl_multiplier, tp_half_level=tp_half_level,
+        be_trigger_level=be_trigger_level, max_hold_bars=max_hold_bars,
+        leverage=leverage, leverage_max=leverage_max, use_numpy_policy=use_numpy_policy,
+    )[0]
 
 
 def compute_metrics(trades, ts_lo_ms, ts_hi_ms):
@@ -137,7 +257,14 @@ def compute_metrics(trades, ts_lo_ms, ts_hi_ms):
     msl = float(min(pnls.min(), 0.0))
     std = float(pnls.std())
     top1 = float(wins.max()) if len(wins) else 0.0
-    cum = np.cumsum(pnls)
+    # 2026-07-28 버그 수정: 시작점(누적 PnL 0)을 첫 고점으로 포함. 기존엔 np.maximum.accumulate가
+    # cum[0]부터 시작해 **첫 거래부터 손실인 구간의 낙폭이 통째로 누락**됐다
+    # (예: pnl=[-50,+100] → 실제 낙폭 50인데 0으로, [-30,-30,-30] → 90인데 60으로 보고).
+    # 같은 파일의 compound_metrics는 peak=start_equity로 이미 시작점을 고점에 포함하고 있어
+    # 두 MDD 계산이 서로 어긋나 있던 것. 이 mdd는 리포트 표시 전용(v9_kpi·합격기준·모델선택
+    # 미사용)이고, 실측상 기존 런들은 초반 하락폭이 최대낙폭에 못 미쳐 값 변화가 없었음
+    # (valid/test × BTC/ETH 4건 모두 차이 0.0) — 학습 초반 붕괴 체크포인트에서만 값이 달라진다.
+    cum = np.concatenate(([0.0], np.cumsum(pnls)))
     mdd = float((np.maximum.accumulate(cum) - cum).max())
     # 증거금(100 USDT) 거의 다 날린 거래 건수 — 순수 관측 지표, 모델 선택엔 미관여.
     # "총 PnL이 좋아도 개별 거래에서 계좌를 거의 다 날리는 일이 실제로 몇 번이나 있었는가"를 직접 확인하기 위함.
@@ -190,6 +317,14 @@ def compound_metrics(trades, ts_lo_ms, ts_hi_ms, start_equity=100.0):
         if equity <= 0.0:
             equity = 0.0
             bankrupt = True
+            # 2026-07-28 버그 수정: 기존엔 여기서 곧바로 break해 아래 mdd_pct 갱신을 건너뛰는
+            # 바람에 **전액 파산이 mdd_pct=0.0(=낙폭 없음)으로 기록**됐다(첫 거래에서 파산하면
+            # 0.0 그대로). 파산은 고점 대비 100% 손실이므로 명시적으로 100.0을 기록한다.
+            # 지금까지는 compound_mdd_pct가 참고 지표라 표시상의 문제였지만, 2026-07-28부터
+            # v9_kpi 점수(가중 30%) + 하드게이트(MDD<70)에 쓰이면서 방향이 정반대로 뒤집히는
+            # 치명적 버그가 됨 — 파산 체크포인트가 z_mdd에서 최대 보너스(+4.12)를 받고 게이트도
+            # 통과해버림. (실제 선택은 near_liq_n 가드가 간접 차단해왔으나 의존이 위태로웠음.)
+            mdd_pct = 100.0
             break
         peak = max(peak, equity)
         mdd_pct = max(mdd_pct, (1.0 - equity / peak) * 100.0)
@@ -235,6 +370,51 @@ def monthly_sel_score(trades, ts_lo_ms, ts_hi_ms):
     logs = monthly_log_multiples(trades, ts_lo_ms, ts_hi_ms)
     arr = np.asarray(logs, dtype=np.float64)
     return float(arr.mean() - arr.std()), logs
+
+
+# ---------------------------------------------------------------------------
+# v9_kpi — best 체크포인트 선택 점수 (2026-07-28 도입, sel_monthly_log 단독 기준 대체)
+#
+# 안정성 최우선 요구에 따라 수익성(sel_monthly_log) + 낙폭(compound_mdd_pct) +
+# 꼬리위험(max_single_loss) 세 축을 4:3:3으로 합성한다.
+#
+# ⚠️ 아래 상수는 절대 바꾸지 말 것 (바꾸면 과거 런과 점수 비교 불가):
+#   ValidationCallback은 `v9_kpi > best_score`로 **학습 초반 점수와 후반 점수를 비교**해
+#   best를 교체한다. 정규화 계수가 "지금까지 나온 표본의 통계"처럼 시간에 따라 변하면
+#   초반/후반 점수가 서로 다른 자로 잰 값이 되어 대소 비교 자체가 무의미해진다.
+#   그래서 러닝 z-score가 아니라 **고정 상수**를 쓴다.
+#
+# 스케일 산출 근거 (2026-07-28, 과거 4개 런 × BTC 검증 525회 중 하드게이트 통과분 실측):
+#   pooled std — sel_monthly_log 0.516 / compound_mdd_pct 17.1 / max_single_loss 12.1
+#   → 이 산포로 나눠야 세 항이 실제로 대등해진다. "값의 범위"(0~100 vs ±1.5)로 맞추면 틀림.
+#   IQR 기준도 검토했으나 max_single_loss의 꼬리가 두꺼워(min -81.3) 혼자 분산의 50.7%를
+#   차지해버려 기각. std 기준 + 4:3:3 가중 시 실측 분산기여 sel 37.0% / mdd 31.8% / msl 31.2%.
+# 중심값(0 / 70 / -30)은 순위에 영향 없는 단순 오프셋 — v9_kpi≈0이 "평범한 체크포인트",
+#   +1이 "종합 1σ 우수"로 읽히게 하는 해석 편의용.
+# 주의: sel_monthly_log(−std 항)·compound_mdd_pct·max_single_loss는 서로 독립이 아니다
+#   (실측 상관 sel↔mdd +0.76, sel↔msl +0.24, mdd↔msl +0.52). 즉 4:3:3은 "세 축 균등"이
+#   아니라 [수익·낙폭] 축에 무게가 실린 구성 — 안정성 우선 의도에 부합해 채택한 것.
+V9_KPI_CENTER = {"sel": 0.0, "mdd": 70.0, "msl": -30.0}
+V9_KPI_SCALE = {"sel": 0.50, "mdd": 17.0, "msl": 12.0}
+V9_KPI_WEIGHT = {"sel": 4.0, "mdd": 3.0, "msl": 3.0}
+MAX_COMPOUND_MDD_PCT = 70.0   # best 후보 자격 하드게이트 (2026-07-28) — 이 이상은 실전 부적합
+
+
+def v9_kpi(sel_monthly_log, compound_mdd_pct, max_single_loss, detail=False):
+    """best 체크포인트 선택 점수 (높을수록 좋음). 세 지표 전부 "높을수록 좋음"으로 방향을
+    맞춘 뒤 고정 상수로 정규화해 4:3:3 가중 평균한다 (위 상수 블록 주석 참고).
+
+    compound_mdd_pct는 낮을수록, max_single_loss는 0에 가까울수록 좋으므로 부호를 뒤집는다.
+    detail=True면 항별 기여도를 함께 반환 (진단용, 선택 로직엔 미사용).
+    """
+    z = {
+        "sel": (float(sel_monthly_log) - V9_KPI_CENTER["sel"]) / V9_KPI_SCALE["sel"],
+        "mdd": (V9_KPI_CENTER["mdd"] - float(compound_mdd_pct)) / V9_KPI_SCALE["mdd"],
+        "msl": (float(max_single_loss) - V9_KPI_CENTER["msl"]) / V9_KPI_SCALE["msl"],
+    }
+    w_sum = sum(V9_KPI_WEIGHT.values())
+    score = sum(V9_KPI_WEIGHT[k] * z[k] for k in z) / w_sum
+    return (float(score), z) if detail else float(score)
 
 
 def yearly_breakdown(trades):
@@ -288,31 +468,45 @@ def evaluate(model, symbols, split, fee_rate=0.0005, decision_stride=1,
     bounds = split_bounds(list(paths.values()), final=final_split)
     report = {"split": split, "fee_rate": fee_rate, "exit_mode": exit_mode, "symbols": {}}
     all_trades = []
+    # 2026-07-28: 심볼별 순차 롤아웃 → 독립 레인 배치 1회 호출 (속도 최적화, 결과 불변)
+    targets = []
     for sym, path in paths.items():
         lo, hi = bounds[path][split]
-        ts = np.load(path)["ts_1m"]
         if hi - lo < 100:
             print(f"[{sym}] split '{split}' too small, skipped")
             continue
-        trades = run_policy_on_range(model, path, lo, hi, n_segments=n_segments,
-                                     decision_stride=decision_stride, fee_rate=fee_rate,
-                                     exit_mode=exit_mode, sl_multiplier=sl_multiplier,
-                                     tp_half_level=tp_half_level, be_trigger_level=be_trigger_level,
-                                     max_hold_bars=max_hold_bars, leverage=leverage, leverage_max=leverage_max)
+        targets.append((sym, path, lo, hi))
+    trades_by_sym = run_policy_on_ranges(model, targets, n_segments=n_segments,
+                                         decision_stride=decision_stride, fee_rate=fee_rate,
+                                         exit_mode=exit_mode, sl_multiplier=sl_multiplier,
+                                         tp_half_level=tp_half_level, be_trigger_level=be_trigger_level,
+                                         max_hold_bars=max_hold_bars, leverage=leverage,
+                                         leverage_max=leverage_max)
+    for sym, path, lo, hi in targets:
+        ts = np.load(path)["ts_1m"]
+        trades = trades_by_sym[sym]
         m = compute_metrics(trades, int(ts[lo]), int(ts[hi - 1]))
         cm = compound_metrics(trades, int(ts[lo]), int(ts[hi - 1]))
         acc = acceptance(m, trades)
+        sel, logs_m = monthly_sel_score(trades, int(ts[lo]), int(ts[hi - 1]))
+        kpi, kpi_z = v9_kpi(sel, cm["mdd_pct"], m["max_single_loss"], detail=True)
         report["symbols"][sym] = {
             "metrics": m, "compound": cm, "acceptance": acc, "yearly": yearly_breakdown(trades),
+            "sel_monthly_log": sel, "v9_kpi": kpi, "v9_kpi_z": kpi_z,
         }
         all_trades.extend(trades)
         if verbose:
             print(f"\n=== [{sym}] {split} ===")
             print(fmt_metrics(m))
             print(fmt_compound(cm))
-            sel, logs_m = monthly_sel_score(trades, int(ts[lo]), int(ts[hi - 1]))
             print(f"  [월별 복리] sel={sel:+.4f} (mean−std of ln m)  "
                   f"m_i={[round(float(np.exp(l)), 2) for l in logs_m]}")
+            # best 선택 점수 — 학습 중 ValidationCallback이 쓰는 것과 완전히 동일한 식
+            gate = "통과" if (m["trades_per_month"] >= MIN_TRADES_PER_MONTH
+                            and m["near_liq_n"] == 0
+                            and cm["mdd_pct"] < MAX_COMPOUND_MDD_PCT) else "탈락"
+            print(f"  [v9_kpi] {kpi:+.4f}  (sel {kpi_z['sel']:+.2f} / mdd {kpi_z['mdd']:+.2f} / "
+                  f"msl {kpi_z['msl']:+.2f}, 가중 4:3:3)  best후보 게이트: {gate}")
             print(f"  acceptance: {acc}")
             print(f"  yearly: { {y: round(v['pnl'], 1) for y, v in yearly_breakdown(trades).items()} }")
 
@@ -354,8 +548,14 @@ def main():
                         help="배포 전 최종학습용 95/5(train/valid) 분할 기준으로 평가 (test 없음, 2026-07-23)")
     args = parser.parse_args()
 
-    from stable_baselines3 import PPO
-    model = PPO.load(args.model, device="cpu")
+    # 2026-07-27: rl 모드는 action masking 도입으로 MaskablePPO 저장 포맷으로 전환됨 —
+    # 기존(masking 이전) rl 체크포인트는 정책 클래스가 달라 호환 안 됨(재학습 필요).
+    if args.exit_mode == "rl":
+        from sb3_contrib import MaskablePPO
+        model = MaskablePPO.load(args.model, device="cpu")
+    else:
+        from stable_baselines3 import PPO
+        model = PPO.load(args.model, device="cpu")
 
     if args.split == "test":
         if args.final_split:

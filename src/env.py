@@ -712,6 +712,18 @@ class TradingEnvV9(gym.Env):
 
     # ---------- rl 모드: 보유 중 풀 컨트롤 (dense MtM 보상, 방향은 fade 고정) ----------
 
+    def action_masks(self):
+        """2026-07-27: sb3-contrib MaskablePPO용 — 상태에 안 맞는 행동(무포지션+Close,
+        보유중+Enter)을 후보에서 물리적으로 제거. rl 모드 전용, {Hold, Enter, Close} 순서
+        (ACT_HOLD/ACT_ENTER/ACT_CLOSE와 동일 인덱스). adaptive/rule은 이 메서드가 호출될
+        일이 없지만(행동공간 자체가 다름 — adaptive는 Box, rule은 Discrete(2)이며 둘 다
+        상태 무관 전부 유효), 방어적으로 호출 시 예외를 낸다."""
+        if self.exit_mode != "rl":
+            raise NotImplementedError("action_masks()는 rl 모드 전용입니다.")
+        if self.pos_dir == 0:
+            return [True, True, False]
+        return [True, False, True]
+
     def _step_rl(self, action):
         """2026-07-20 재설계: Discrete(3) {Hold, Enter, Close}. 진입 방향은 adaptive/rule과
         동일하게 항상 파동 역추세(fade)로 자동 결정 — 정책은 진입/청산 "시점"만 학습한다.

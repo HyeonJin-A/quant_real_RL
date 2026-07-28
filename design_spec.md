@@ -4,7 +4,7 @@
 
 현재 아키텍처는 **`rl` 모드(보유 중 풀 컨트롤)**가 주력입니다: 정책이 매 1분 행마다 Hold/Enter/Close를 직접 결정하고, 보상은 매 스텝 mark-to-market 손익 변화량(dense reward)입니다. 초기 설계(`V9 Design.md`)의 풀 컨트롤은 2026-07-16 "아무것도 안 함" 붕괴로 한 차례 폐기됐었으나, 2026-07-20 재설계(방향 fade 고정 + explore_bonus 이식)로 재도전해 현재 주력 모드로 자리잡았습니다 (`train.py`/`eval.py` `--exit-mode` 기본값도 2026-07-25부터 `rl`). `adaptive`(semi-MDP, 진입 시 레버리지/손절/반익/완익 전부 확정)와 `rule`(V8 엔진 고정 청산)은 레거시로 유지됩니다. 본 문서가 현행 사양의 기준입니다.
 
-*최종 갱신: 2026-07-26*
+*최종 갱신: 2026-07-28*
 
 ---
 
@@ -146,12 +146,13 @@ leverage_max = clip( 20 / (gap% + ATR% × 선택한 sl_multiplier + 0.1), 1, 50 
 - **목적**: 완익 사전결정 구조 이슈(`V9 Issue - 완익 사전결정 구조.md`)의 최후 후보안 — adaptive는 진입 시점에 완익 목표를 박제하는데, 보유 기간의 신규 정보를 활용해 "언제 접을지"를 매 스텝 재판단하게 함.
 - **행동**: `{0: Hold, 1: Enter, 2: Close}`. 같은 라벨이 상태에 따라 의미가 다름 — 무포지션에서 Close, 보유 중 Enter는 no-op(Hold와 동일 처리). 이건 상태-조건부 정책의 표준 패턴(예: 문이 닫혀있을 때만 "밀기"가 유효)이라 학습 저해 요인이 아님 (2026-07-20 설계 논의).
 - **진입 방향은 adaptive/rule과 동일하게 파동 역추세(fade)로 자동 결정** — 방향 선택이라는 이 프로젝트에서 한 번도 검증된 적 없는 과제를 추가로 얹지 않기 위한 의도적 축소. 방향을 바꾸려면 Close 후 다음 결정에서 그 시점 fade 방향으로 재진입해야 함(옛 "플립" 개념 없음).
-- **레버리지는 `--leverage` 고정 상수**(rl 모드 CLI 기본값 **3.0**, 2026-07-24 — 미지정 시 env.py 생성자 자체 기본값은 20.0이지만 rl 모드는 train.py에서 3.0으로 덮어씀. leverage=1 베이스라인 대비 test에서도 total_pnl/PF/복리 대폭 개선 확인, 5장 참고) — adaptive처럼 진입마다 정책이 고르지 않음. Discrete 출력(4개/3개 숫자 중 하나 선택)엔 연속값을 담을 자리가 없어, 혼합형(이산+연속) 정책 없이는 구조적으로 불가능 (로드맵 항목으로 남김).
+- **레버리지는 `--leverage` 고정 상수**(rl 모드 CLI 기본값 **5.0**, 2026-07-28 — 미지정 시 env.py 생성자 자체 기본값은 20.0이지만 rl 모드는 train.py에서 5.0으로 덮어씀. 2026-07-24~07-27엔 3.0이었고, leverage=1 베이스라인 대비 test에서도 total_pnl/PF/복리 대폭 개선을 확인한 값. 10배도 실험했으나 청산 위험이 과도해 실전 배제로 결론나 5.0 채택, 6장 참고) — adaptive처럼 진입마다 정책이 고르지 않음. Discrete 출력(4개/3개 숫자 중 하나 선택)엔 연속값을 담을 자리가 없어, 혼합형(이산+연속) 정책 없이는 구조적으로 불가능 (로드맵 항목으로 남김).
 - **보상**: adaptive/rule의 semi-MDP(결정 1개=거래 1개=완결 보상)와 달리, 매 1m 행마다 mark-to-market 자산 변화량(dense reward) + Enter 시 1회 `explore_bonus`(adaptive와 동일 커리큘럼 재사용, 2026-07-20 이식).
 - **⚠️ 안전장치 격차**: adaptive의 `dynamic_leverage_ceiling`(거래당 손실 20% 캡)이 없음 — 손실은 강제청산가(~-100%)까지 열려있고, 파산 방지는 전적으로 정책이 학습한 청산가 거리 판단에 의존 (rule 모드와 동일한 리스크 프로파일, adaptive보다 구조적으로 위험함).
 - **붕괴 이력**: 2026-07-16 자유방향판(Discrete(4), Open-Long/Short 구분)에서 "아무것도 안 함" 붕괴 확인 (검증 4회 연속 거래 0건). 원인은 보상 지연이 아니라 — 이미 매 스텝 밀집 보상이었음 — "Enter=확실한 수수료 비용, Hold=항상 0"이라는 구조적 비대칭. explore_bonus 미이식 상태로 시도된 것이었음.
 - **에피소드 길이**: 전 모드 기본 30일 (2026-07-21: rl 모드만 14일로 잠깐 내려봤으나(리셋 빈도 확보 목적) 다음 런 valid 성과가 베이스라인보다 나빠져(sel_monthly_log -0.0766→-0.21~-0.29) 30일로 원복 — 다만 그 런엔 explore_bonus(0.15)도 그대로였어서 원인이 에피소드 길이인지 explore_bonus인지 완전히 격리되진 않음, 6장 이력 참고).
 - **에피소드 종료 시 강제청산 완화**(2026-07-21): 목표 길이(`episode_len_rows`)에 도달해도 포지션 보유 중이면 즉시 끊지 않고 데이터 끝(`hi-1`)까지 연장해 자연 청산을 기다림 — 정책 판단과 무관한 임의 시점 강제청산이 학습 신호에 섞이는 것을 방지. 데이터가 실제로 끝나버리는 경우에만 부득이 종가 정산(기존과 동일). adaptive/rule은 진입 즉시 같은 스텝에서 청산까지 완결(semi-MDP)되므로 이 이슈 자체가 해당 없음.
+- **Action Masking (2026-07-27 적용)**: `TradingEnvV9.action_masks()`가 상태에 안 맞는 행동(무포지션+Close, 보유중+Enter)을 물리적으로 제거 — `[Hold, Enter, Close]` 순서 boolean 배열, 무포지션 `[T,T,F]`/보유중 `[T,F,T]`. rl 모드는 이제 `sb3_contrib.MaskablePPO`(기존 `stable_baselines3.PPO` 대체)로 학습·평가 — `train.py`가 `exit_mode=="rl"`일 때만 `PPOClass=MaskablePPO` 분기, adaptive/rule은 기존 `PPO` 유지. `eval.py`도 `--exit-mode rl`이면 `MaskablePPO.load()` + `run_policy_on_range`가 매 스텝 `env.action_masks()`를 계산해 `model.predict(..., action_masks=...)`에 전달. **기존(masking 이전) rl 체크포인트와 정책 클래스가 달라 완전 비호환** — 처음부터 재학습 필요(`V9 Design TODO - Action Masking.md`에서 이미 예고된 트레이드오프). `Monitor` 래퍼가 `action_masks` 호출을 내부 `TradingEnvV9`로 자동 위임하므로 별도 `ActionMasker` 래퍼는 불필요.
 
 ---
 
@@ -167,16 +168,16 @@ leverage_max = clip( 20 / (gap% + ATR% × 선택한 sl_multiplier + 0.1), 1, 50 
 | clip_range / vf_coef | 0.2 / 0.5 | |
 | ent_coef | 0.01 → 0.005 (CLI로 override 가능) | 기본값은 70% 지점까지 0.01 고정 유지 후 0.005로 선형 감쇠. 2026-07-21: 한때 85%/0.008로 상향했다가 원복(6장 이력 참고) — 같은 런에서 explore_bonus(0.15, 50%까지 유지)가 과매매 붕괴를 25M까지 더 길게 끌고 간 정황이 드러나 ent_coef보다 explore_bonus 쪽이 원인일 가능성이 높아짐. adaptive 연속 액션에서 std 폭주 억제가 필요했던 2026-07-20 실험(`--ent-coef-start 0.005 --ent-coef-hold-frac 0.2`, 승률 27~29%→37~40%)은 목적이 달라 별도 오버라이드로 유지 |
 | device | **cpu 강제** | 환경 간 연산 재현성 (GPU 미활용) |
-| 총 스텝 / 워커 | 기본 50M / SubprocVecEnv 4 (심볼별 균등 배분) | |
+| 총 스텝 / 워커 | 기본 100M / 워커 14 (심볼별 균등 배분). VecEnv 기본값은 2026-07-28부터 **DummyVecEnv**(단일 프로세스 순차 실행) — `--no-dummy-vec`으로 SubprocVecEnv 병렬 경로 사용 | action masking 도입 후 SubprocVecEnv IPC 왕복이 스텝당 2회가 돼 병렬화 이득이 역전됨(6장 07-28) |
 
 ### <span style="color: #2E8B57;">학습 안정화 콜백 (붕괴 이력 3건에 대한 대응 장치)</span>
 | 콜백 | 역할 |
 |---|---|
 | **LogStdClampCallback** (adaptive 전용) | 매 롤아웃 시작 시 policy.log_std를 [-3.0, 1.0](std≈0.05~2.7)로 강제 clamp — 연속 액션 엔트로피 무제한 상방으로 인한 **표준편차 폭주 방지의 핵심**. 평가는 deterministic이라 판단력엔 영향 없음. rl 모드는 Discrete(이산)이라 log_std 자체가 없어 해당 없음(폭주 위험 구조적으로 없음) |
 | EntCoefSchedule | ent_coef 0.01을 70% 지점까지 고정 유지 후 0.005로 감쇠 (전 모드 공통. 2026-07-21: 85%/0.008로 상향했다가 당일 원복, 6장 이력 참고) |
-| ExploreBonusSchedule (adaptive+rl) | Enter 시 임시 보너스, 모드별 기본값(2026-07-24: rl=**0.003**, adaptive=0.001, CLI로 override) → 50% 지점에서 0 (콜드스타트 함정 돌파용, cum_pnl/평가엔 미반영). 2026-07-20: rl 모드에도 이식. 2026-07-22: 기본값 0.15→0.001 — rl 모드에서 0.15는 진입 확정 수수료비용의 300배라 실제 손익 신호를 압도, "진입을 자주"만 배우고 "잘"은 못 배우게 만듦(6장 이력). 2026-07-24: rl 기본 레버리지가 3으로 오르며 확정 수수료비용도 3배가 돼 0.003으로 재조정(같은 2배 비율 유지) |
+| ExploreBonusSchedule (adaptive+rl) | Enter 시 임시 보너스, 모드별 기본값(2026-07-28: rl=**0.005**, adaptive=0.001, CLI로 override) → 50% 지점에서 0 (콜드스타트 함정 돌파용, cum_pnl/평가엔 미반영). 2026-07-20: rl 모드에도 이식. 2026-07-22: 기본값 0.15→0.001 — rl 모드에서 0.15는 진입 확정 수수료비용의 300배라 실제 손익 신호를 압도, "진입을 자주"만 배우고 "잘"은 못 배우게 만듦(6장 이력). 2026-07-24: rl 기본 레버리지가 3으로 오르며 확정 수수료비용도 3배가 돼 0.003으로 재조정(같은 2배 비율 유지). 2026-07-28: 레버리지 3→5에 맞춰 같은 비율로 0.005 |
 | LeverageMaxSchedule (adaptive 전용, `--leverage` 미지정 시만) | 레버리지 상한 10 → 30% 지점까지 50으로 선형 확대 (초반 무작위 탐험의 손실 분산 억제, 평가는 항상 무시). rl 모드는 레버리지가 `--leverage` 고정 상수라 커리큘럼 대상 아님 |
-| ValidationCallback | 50만 스텝마다 검증셋 전체 결정론적 롤아웃 → TensorBoard 기록 + best 저장 (5장 모델 선택 기준) |
+| ValidationCallback | 50만 스텝마다 검증셋 전체 결정론적 롤아웃 → TensorBoard 기록 + best 저장 (5장 모델 선택 기준). 2026-07-28부터 심볼별 순차 호출이 아니라 `run_policy_on_ranges`로 전 심볼을 한 배치에 롤아웃 (5장 「롤아웃 속도 최적화」, 결과 불변) |
 | CheckpointCallback | 100만 스텝마다 체크포인트 |
 
 - ⚠️ 커리큘럼 갱신은 반드시 `VecEnv.env_method("set_curriculum", ...)` 사용 — `set_attr`은 Monitor 래퍼 표면에 그림자 속성만 만들고 내부 env에 안 닿는 SB3 버그 있음 (2026-07-17 실측 확인).
@@ -190,12 +191,27 @@ leverage_max = clip( 20 / (gap% + ATR% × 선택한 sl_multiplier + 0.1), 1, 50 
 - 시계열 70/15/15 (train/valid/test), 날짜 경계는 두 심볼 공통. **테스트셋은 모든 개발 종료 후 단 1회만 평가.**
 - **최종학습용 분할 (2026-07-23, `--final-split`)**: 배포 전, 개발 중 확정된 설정으로 처음부터 재학습할 때 95/5(train/valid, test 없음)로 전환. `train.py`/`eval.py` 둘 다 지원(`split_bounds(..., final=True)`). ⚠️ 기존 체크포인트에 이어학습하는 게 아니라 **처음부터 새로 학습**해야 함 — lr(`progress_remaining` 기반 선형 감쇠)·ent_coef·explore_bonus 스케줄이 이미 소진된 상태로 이어붙이면 사실상 새 데이터를 거의 못 배움.
 - 평가는 분할 구간 전체 **단일 연속 롤아웃** (2026-07-19: 16분할 병렬은 경계 오차 ~8-12% 실측으로 폐기).
-- 지표: 거래수, 월평균 거래수, 승률, 총 PnL, 평균 PnL, MSL, PnL 표준편차, PF, top1_share, MDD, near_liquidation 건수, 연도별 분해, 수수료 민감도(`--fee`), `max_upnl`(rl 모드 전용, 아래 참고). (V9 Score는 2026-07-25 완전 폐기, 아래 참고)
 
-### <span style="color: #2E8B57;">모델 선택 기준: BTC 월별 복리 log-multiple (2026-07-20 교체)</span>
+#### <span style="color: #2E8B57;">롤아웃 속도 최적화 (2026-07-28, `검증 롤아웃 속도 최적화.md`)</span>
+검증 1회 152.9초 → **13.1초 (11.7배)**, 거래 목록까지 완전 동일. 순수 CPU 로직 최적화이며 **검증 로직·결과는 일절 바뀌지 않는다**. 두 축으로 구성:
+1. **numpy 직접 추론** (`NumpyDiscretePolicy`, 주 효과): 실측상 검증 시간의 98%가 실제 연산이 아니라 torch `predict()` 호출 오버헤드였음(124.8µs/step vs `env.step()` 1.4µs/step; batch=1/2/4가 119.5/129.5/124.6µs로 거의 평평 = 순수 고정 오버헤드). 정책망이 `Linear→Tanh→Linear→Tanh→action_net`뿐이라 numpy 3줄로 동일 연산이 되고, 평가는 항상 `deterministic=True`(argmax)라 샘플링 경로도 불필요 → 7.2µs/step (약 17배). 마스킹은 `np.where(mask, logits, -1e8)`로 `sb3_contrib`의 `MaskableCategorical.apply_masking`과 동일 상수를 사용(softmax는 단조라 `argmax(probs)`와 `argmax(logits)`가 동일).
+2. **독립 레인 배치** (`run_policy_on_ranges`): 심볼별로 따로 돌던 롤아웃을 한 배치로 묶어 `predict()` 호출 횟수를 심볼 수만큼 나눔. 각 레인은 여전히 자기 구간 전체를 1행씩 순차로 걷는다(단일 연속 롤아웃 성질 보존) — 심볼끼리는 완전히 독립이라 함께 추론하든 따로 하든 결과가 동일.
+
+- **안전장치**: `numpy_policy_if_supported()`가 구조(Discrete 액션 + `[64,64]`+Tanh + 파라미터 없는 features_extractor)를 검사해 하나라도 다르면 `None`을 반환 → 기존 torch `model.predict` 경로로 자동 폴백. adaptive(Box 연속 액션)는 항상 폴백이라 동작 100% 불변.
+- 🚨 **시간축 분할(`n_segments>1`)과 혼동 금지** — 독립 레인 배치는 시간축을 안 건드려 안전하지만, 한 심볼을 N토막 내는 것은 경계 강제청산 + 재수렴 구간이 생겨 결과가 달라진다(2026-07-19 폐기). 속도를 위해 다시 손대면 안 됨.
+- **채택 전 A/B/C 파리티 검증 통과**: A(torch+심볼별, 기준) / B(torch+배치, 1.81배) / C(numpy+배치, 11.67배)를 같은 체크포인트로 돌려 거래 목록을 항목 단위(`entry_ts`/`exit_ts`/`dir`/`entry_price`/`exit_price`/`pnl`/`reason`)로 대조 — **BTC 2050건·ETH 1867건 전부 완전 일치, PnL도 소수점까지 동일**(`+1992.7983`/`+4595.4718`). 총합만 비교하면 상쇄되어 놓치므로 반드시 항목 단위로 볼 것.
+- 부가 최적화(문서 7장 캐시 반복 로드 제거)는 **미적용** — 실측상 `np.load(ts_1m)` 0.08초, `TradingEnvV9.__init__` 0.87초로 검증 1회의 1% 수준이라 실익이 없고, env는 가변 상태(`trades`/`pos_dir`)를 들고 있어 재사용 시 오염 위험이 있음.
+- 지표: 거래수, 월평균 거래수, 승률, 총 PnL, 평균 PnL, MSL, PnL 표준편차, PF, top1_share, **MDD**(고정 100 USDT 진입 기준 누적 PnL 곡선의 절대 낙폭, 단위 USDT — 복리 기준 `compound_mdd_pct`(%)와는 이름만 비슷한 별개 지표), near_liquidation 건수, 연도별 분해, 수수료 민감도(`--fee`), `max_upnl`(rl 모드 전용, 아래 참고). (V9 Score는 2026-07-25 완전 폐기, 아래 참고)
+
+### <span style="color: #2E8B57;">모델 선택 기준: `v9_kpi` (2026-07-28 교체 — 구 기준은 sel_monthly_log 단독)</span>
 ```
+v9_kpi = (4·z_sel + 3·z_mdd + 3·z_msl) / 10        # 높을수록 좋음
+  z_sel = (sel_monthly_log - 0.0) / 0.50            # 수익성  (mean(ln m) − std(ln m))
+  z_mdd = (70.0 - compound_mdd_pct) / 17.0          # 낙폭     (부호 반전)
+  z_msl = (max_single_loss - (-30.0)) / 12.0        # 꼬리위험 (부호 반전)
+
 m_i = ∏(1 + pnl/100)          # 달력 월 i의 거래들, 월초 자본 1.0 리셋 (하한 0.05 클램프)
-선택 점수 = mean(ln m_i) − std(ln m_i)    # BTC 검증 ~12개월
+sel_monthly_log = mean(ln m_i) − std(ln m_i)    # BTC 검증 ~12개월
 가드1: 월평균 거래수 < 10이면 best 후보 자격 박탈 (무거래=중립 함정 차단, 2026-07-21: 3→10 상향 —
   sel_monthly_log 점수식 자체에는 거래횟수가 반영되지 않아, 저거래(노이즈성) 구간이 문턱만 겨우
   넘기면 우연히 좋은 점수로 best가 될 수 있었음. MIN_TRADES_PER_MONTH(eval.py)를 10으로 상향해
@@ -203,8 +219,23 @@ m_i = ∏(1 + pnl/100)          # 달력 월 i의 거래들, 월초 자본 1.0 �
 가드2: near_liq_n(근접청산 건수) > 0이면 best 후보 자격 박탈 (2026-07-26 추가 — sel_monthly_log
   점수식 자체엔 근접청산 위험이 직접 반영되지 않아, 월별 변동성이 우연히 낮게 나온 위험한
   체크포인트가 best로 뽑힐 수 있었음. 하드 게이트로 차단)
+가드3: compound_mdd_pct >= 70이면 best 후보 자격 박탈 (2026-07-28 추가 — v9_kpi가 낙폭을 감점하긴
+  하지만 수익성/꼬리위험이 아주 좋으면 산술적으로 파산 수준(MDD 100%)도 이길 수 있어 하드게이트로 차단.
+  MAX_COMPOUND_MDD_PCT(eval.py) = 70.0)
 ```
-- **mean(ln m)의 최대화 = 실제 복리 성장률 최대화와 동치** — 선택 목적을 실전 운용 방식(전액 재투입 복리)과 정합시킴. −std는 레짐 편중 감점(기존 4분기 선택식의 취지 계승, 표본 4→12로 안정화).
+#### <span style="color: #2E8B57;">v9_kpi 설계 근거 (2026-07-28)</span>
+안정성(최대낙폭·단일최대손실)을 수익성과 대등하게 보겠다는 요구에 따라, 기존 `sel_monthly_log` 단독 기준을 3축 합성 점수로 교체했다.
+
+- **🚨 상수는 절대 변경 금지** — `ValidationCallback`은 `v9_kpi > best_score`로 **학습 초반 점수와 후반 점수를 비교**해 best를 교체한다. 정규화 계수가 "지금까지 나온 표본의 통계"처럼 시간에 따라 변하면 초반/후반 점수가 서로 다른 자로 잰 값이 되어 대소 비교 자체가 무의미해진다. 그래서 러닝 z-score가 아니라 **고정 상수**를 쓴다. 바꾸면 과거 런과의 점수 비교도 불가능해진다.
+- **스케일 산출 근거**: 과거 4개 런(0724-0001 lev3 / 0726-1719 lev5 / 0727-0934 lev10 / 0727-1840 lev5+masking) × BTC 검증 525회 중 하드게이트 통과분의 pooled std — `sel_monthly_log` 0.516 / `compound_mdd_pct` 17.1 / `max_single_loss` 12.1. **"값의 범위"(0~100 vs ±1.5)가 아니라 실제 산포로 나눠야** 세 항이 대등해진다. IQR 기준도 검토했으나 `max_single_loss`의 꼬리가 두꺼워(min -81.3) 혼자 분산의 50.7%를 차지해 기각.
+- **가중 4:3:3의 실측 분산기여**: sel 37.0% / mdd 31.8% / msl 31.2%.
+- **중심값(0 / 70 / -30)은 순위에 영향 없는 오프셋** — `v9_kpi ≈ 0`이 "평범한 체크포인트", `+1`이 "종합 1σ 우수"로 읽히게 하는 해석 편의용.
+- ⚠️ **세 지표는 서로 독립이 아니다** (실측 상관: sel↔mdd **+0.76**, sel↔msl +0.24, mdd↔msl +0.52 — 전부 "높을수록 좋음"으로 방향 정렬 후). 즉 4:3:3은 "세 축 균등"이 아니라 [수익·낙폭]이 사실상 한 축이라 그쪽에 무게가 실린 구성이며, `sel_monthly_log` 자체가 `−std` 안정성 페널티를 이미 품고 있어 안정성이 중복 계산된다. 안정성 우선이라는 의도에 부합해 그대로 채택한 것.
+- **소급 검증** (과거 런에 적용 시 best 선택 변화): 0727-1840은 **선택 불변**. 0724-0001은 sel +0.189→+0.113(-40%)을 내주는 대신 MDD 46.1%→31.5%(-32%), MSL -20.2→-14.1(-30%)로 이동 — 수익을 조금 양보하고 안정성을 크게 사는 의도된 거동.
+- **가드3의 부작용(의도된 동작)**: MDD 70% 미만을 한 번도 못 찍은 런은 `_best.zip`이 **아예 생성되지 않는다**. 실측상 leverage=10 런(0727-0934)은 MDD 최저가 88.3%라 200회 검증 전부 탈락. 그런 런은 애초에 실전 부적합이라는 판단이며, 경고 출력 없이 그대로 둔다.
+- TB 기록: `valid/BTC-USDT-SWAP/v9_kpi` + 항별 분해 `v9_kpi_z_{sel,mdd,msl}`. `_best_info.json`에도 `btc_v9_kpi`/`btc_v9_kpi_z`/구성 3지표 원값을 함께 남긴다. `eval.py` 리포트에도 동일 식으로 `[v9_kpi]` 줄과 게이트 통과 여부를 출력.
+
+- **mean(ln m)의 최대화 = 실제 복리 성장률 최대화와 동치** (v9_kpi의 `z_sel` 항) — 선택 목적을 실전 운용 방식(전액 재투입 복리)과 정합시킴. −std는 레짐 편중 감점(기존 4분기 선택식의 취지 계승, 표본 4→12로 안정화).
 - 교체 근거 (0719-1459 런 실측): 구 기준 `4분기 v9_score 평균−std`는 승률×1000 항이 점수를 지배해, total_pnl +28(top1 제거 시 적자)인 9.5M 체크포인트가 +418인 50M을 제치고 best로 선택됐고, 복리 MDD 99% 경로도 걸러내지 못했음.
 - `v9_score = (total_pnl − top1) + win_rate×1000`은 TB 기록·합격 기준 ④용 지표로만 유지되다가 **2026-07-25 완전 폐기**됨 (아래 「사전 확정 합격 기준」 참고).
 - 모델 선택은 **BTC 단독** (2026-07-19): min(BTC,ETH) 기준은 만성적으로 ETH에 끌려 내려가 BTC에서 잘하는 체크포인트를 놓치는 문제. ETH는 TB 지표 기록만 유지.
@@ -309,6 +340,13 @@ m_i = ∏(1 + pnl/100)          # 달력 월 i의 거래들, 월초 자본 1.0 �
 | 07-25 | **`train.py`/`eval.py` `--exit-mode` 기본값 `adaptive`→`rl`** | 사용자 지시로 진행(테스트 생략). rl 모드가 이번 세션 전반의 실험 주력이 된 실태를 CLI 기본값에도 반영 — `--exit-mode` 미지정 시 이제 rl로 실행됨. adaptive/rule은 여전히 지원되나 레거시로 재분류(1장 개요, 3장 표 갱신) |
 | 07-26 | **모델 선택에 근접청산(`near_liq_n`) 하드 게이트 추가** | 사용자 지시로 진행. `ValidationCallback`의 `btc_eligible` 조건에 `m["near_liq_n"] == 0`을 추가(기존 월평균 거래수 조건과 AND) — `sel_monthly_log`가 근접청산 위험을 직접 반영하지 않아, 월별 변동성이 우연히 낮게 나온 위험한 체크포인트가 best로 선택될 여지를 하드 게이트로 차단 (5장 가드2) |
 | 07-27 | **(진단용, 임시) `DEBUG_DUMP_TRADES` 디버그 덤프 추가 → 원인 미확정으로 보류, 덤프+코드 제거** | `leverage=5` 런(0726-1719)에서 `sel_monthly_log` 학습중 기록값(best_info.json/TB)과 동일 체크포인트를 `eval.py`로 재로드해 재평가한 값이 반복적으로 부호까지 반대로 나오는 이슈 발견(예: 94.5M 지점 학습중 +0.8038 vs 재평가 -0.3499). 정적 코드 리뷰로는 원인 미발견 — `ValidationCallback`에 BTC 검증마다 그 순간의 trades+모델을 파일 덤프하는 임시 코드 추가(`DEBUG_DUMP_TRADES=1`일 때만 활성화). `leverage=10` 런(0727-0934, 초반/중반+0.65/후반-0.56 등 4개 지점 교차검증)에서는 라이브 기록값과 재로드 재평가값이 거래건수까지 정확히 일치 — 코드 자체의 일반적 버그는 아니고 leverage=5 런의 특정 체크포인트(들)에서만 발생한 일회성 이상 현상으로 잠정 결론. 원인 미확정 상태로 재발 시까지 보류하기로 하고, 디버그 덤프 파일(603개, 128MB) 삭제 + `ValidationCallback`의 덤프 코드 제거 완료 (재발 시 다시 추가) |
+| 07-27 | **rl 모드 Action Masking 적용 (`sb3-contrib` `MaskablePPO` 도입)** | `V9 Design TODO - Action Masking.md` 설계안 실행. `sb3-contrib==2.9.0` 설치(현재 `stable-baselines3==2.9.0`과 버전 정확히 일치, `requirements.txt` 갱신). `env.py`에 `TradingEnvV9.action_masks()` 추가(rl 모드 전용, 무포지션 `[T,T,F]`/보유중 `[T,F,T]`, 그 외 모드 호출 시 예외). `train.py`: `exit_mode=="rl"`일 때만 `PPOClass=MaskablePPO`(그 외 기존 `PPO` 유지) — `ActionMasker` 래퍼 불필요(`Monitor`가 `action_masks` 호출을 위임, sb3_contrib `get_action_masks`가 `env_method`로 직접 조회). `eval.py`: `--exit-mode rl`이면 `MaskablePPO.load()`, `run_policy_on_range`가 `isinstance(model, MaskablePPO)`로 자동 감지해 매 스텝 마스크 계산 후 `predict(..., action_masks=...)`. 스모크 테스트(2만 스텝, `--dummy-vec`) 통과 — 학습·검증·`eval.py` 재로드 추론 전 경로 정상 동작 확인. **기존 rl 체크포인트와 정책 클래스 불일치로 완전 비호환** — 재학습 필요 (사전 예고된 트레이드오프, 3장 참고). 신구 산출물 혼동 방지를 위해 rl 저장 경로도 `v9_fullctrl/` → **`v9_maskablerl/`**로 개명(`mode_subdir()`/`mode_tag`, 8장 참고) — 구 `v9_fullctrl/` 산출물은 과거 기록으로 그대로 둠 |
+| 07-28 | **검증/평가 롤아웃 속도 최적화 — 검증 1회 152.9초→13.1초 (11.7배), 결과 완전 동일** | `검증 롤아웃 속도 최적화.md`(타 프로젝트 적용분) 이식. 프로파일링 결과 검증 시간의 98%가 실제 연산이 아니라 torch `predict()` 호출 오버헤드였음(124.8µs/step vs `env.step()` 1.4µs/step, batch 1~4에서 비용이 평평 = 순수 고정 오버헤드). ① `eval.py`에 `NumpyDiscretePolicy` 추가 — `Linear→Tanh→Linear→Tanh→action_net`을 numpy 3줄로 재현(7.2µs/step, 17배), 마스킹은 `np.where(mask, logits, -1e8)`로 `MaskableCategorical.apply_masking`과 동일 상수 사용. ② `run_policy_on_ranges` 추가 — 심볼(독립 레인)을 한 배치로 묶어 `predict()` 호출 횟수를 심볼 수만큼 절감(시간축은 불변, `n_segments`는 기본 1 유지). `run_policy_on_range`(단수)는 기존 시그니처 그대로 두고 내부 위임이라 다른 호출부 영향 없음. `numpy_policy_if_supported()`가 구조 불일치 시 torch로 자동 폴백하므로 adaptive(Box 액션)는 동작 100% 불변. **A/B/C 파리티 검증 통과** — A(torch+심볼별) 대비 B(torch+배치) 1.81배·C(numpy+배치) 11.67배, 거래 목록 항목 단위 대조에서 BTC 2050건·ETH 1867건 전부 완전 일치(PnL `+1992.7983`/`+4595.4718` 소수점까지 동일). `train.py` `ValidationCallback` 스모크 결과도 최적화 전과 지표가 동일(BTC `sel_monthly_log=0.0609`, `max_upnl=0.447`)함을 별도 확인. 부가 최적화(캐시 반복 로드 제거)는 실익 1% 미만이라 미적용 (5장 참고) |
+| 07-28 | **rl 모드 CLI 기본값 갱신: `--leverage` 5.0, `--explore-bonus-start` 0.005, VecEnv `DummyVecEnv`** | 직전 런(0728-0741, leverage=5·explore_bonus=0.005·DummyVecEnv)에서 valid 지표가 기존과 동일하게 유지되면서 속도만 개선된 것을 확인해 그대로 기본값으로 승격. ① `--leverage` 3.0→**5.0** (10배도 실험(0727-0934)했으나 청산 위험이 과도해 실전 배제로 결론), ② `--explore-bonus-start` 0.003→**0.005** (레버리지 3→5에 맞춘 확정 수수료비용의 약 2배 비율 유지), ③ `--dummy-vec`을 `BooleanOptionalAction`+`default=True`로 전환 — action masking 도입으로 `MaskablePPO`가 매 스텝 `env.step()`과 별도로 `action_masks()`를 한 번 더 조회하면서 SubprocVecEnv의 IPC 왕복이 스텝당 2회가 됐고, `[64,64]` 초소형 MLP라 연산량보다 통신 비용이 커서 병렬화 이득이 역전됨(벤치마크 fps 약 9,900→16,800, 약 1.7배). `--no-dummy-vec`으로 기존 병렬 경로 사용 가능. 부수 수정: DummyVecEnv에선 `make_env_fn`의 워커 코어 핀이 별도 프로세스가 없어 **메인 프로세스 어피니티를 워커 수만큼 덮어써 Core 0 고정이 풀리는** 문제가 있어 `pin_core` 플래그로 건너뛰도록 수정(어피니티 로그 문구도 모드별 분기). 또한 기존 버그 1건 수정 — `--ent-coef-hold-frac` help 텍스트의 `50%`가 argparse `%` 치환을 깨뜨려 **`--help` 자체가 크래시**하던 것을 `50%%`로 이스케이프 (이번 변경과 무관한 선재 버그) |
+| 07-28 | **best 체크포인트 선택 기준을 `sel_monthly_log` 단독 → `v9_kpi`(수익성:낙폭:꼬리위험 = 4:3:3)로 교체 + MDD 하드게이트 추가** | 안정성(최대낙폭·단일최대손실)을 수익성과 대등하게 반영하겠다는 요구. `eval.py`에 `v9_kpi()` 신설 — `(4·z_sel + 3·z_mdd + 3·z_msl)/10`, `z_sel=sel/0.50`, `z_mdd=(70−compound_mdd_pct)/17`, `z_msl=(max_single_loss+30)/12`. 스케일 상수는 과거 4개 런 × BTC 검증 525회(하드게이트 통과분)의 pooled std 실측치(0.516/17.1/12.1)에서 도출 — **범위가 아니라 실제 산포로 맞춰야** 대등해지며, IQR 기준은 `max_single_loss` 꼬리가 두꺼워 혼자 분산 50.7%를 먹어 기각. 4:3:3 실측 분산기여 sel 37.0%/mdd 31.8%/msl 31.2%. 🚨 상수는 러닝 통계가 아니라 **고정값**이어야 함(초반·후반 점수 비교가 성립해야 하므로, 5장 참고). 가드3 신설 — `compound_mdd_pct >= 70`이면 best 후보 자격 박탈(`MAX_COMPOUND_MDD_PCT`); v9_kpi만으로는 수익성·꼬리위험이 아주 좋으면 파산 수준(MDD 100%)도 산술적으로 이길 수 있어 하드 차단. ⚠️ 이 게이트를 한 번도 못 넘은 런은 `_best.zip`이 아예 안 생김(의도된 동작, 경고 출력 없음 — leverage=10 런 0727-0934는 MDD 최저 88.3%로 200회 전멸). 소급 검증: 0727-1840은 선택 불변, 0724-0001은 sel +0.189→+0.113 대신 MDD 46.1→31.5%·MSL -20.2→-14.1로 이동(의도된 거동). TB에 `v9_kpi` + 항별 분해 `v9_kpi_z_{sel,mdd,msl}` 기록, `_best_info.json`·`eval.py` 리포트에도 반영. 스모크 테스트 통과 |
+| 07-28 | **🐛 `compound_metrics` 파산 시 `mdd_pct=0` 버그 수정 (선재 버그, v9_kpi 도입으로 치명화)** | `equity<=0`(전액 파산) 분기가 `mdd_pct` 갱신 **전에** `break`해서, **최악의 결과인 전액 파산이 낙폭 0%로 기록**되고 있었음(첫 거래에서 파산하면 0.0 그대로). 지금까지는 `compound_mdd_pct`가 참고 지표라 표시상의 문제였지만, 같은 날 도입된 v9_kpi에서 이 값이 점수의 30% + 하드게이트(MDD<70)에 쓰이면서 **방향이 정반대로 뒤집히는 치명적 버그**가 됨 — 파산 체크포인트가 `z_mdd`에서 최대 보너스(+4.12)를 받고 게이트까지 통과. (실제 선택은 `near_liq_n` 가드가 간접 차단해왔으나 — 파산은 pnl≤-100이라 항상 near_liq에 잡힘 — 그 의존이 위태로웠음.) 파산 시 `mdd_pct=100.0`을 명시적으로 기록하도록 수정. 실측 재현: 학습 초반 검증에서 MSL=-100인 체크포인트가 수정 전 `mdd_pct=0 / v9_kpi=-1.37`, 수정 후 `mdd_pct=100 / v9_kpi=-3.13`. ⚠️ 부수 영향 — 과거 리포트에 `BANKRUPT`로 표시됐던 케이스의 `MDD%` 표기값이 달라진다(파산 직전까지 누적된 낙폭 → 100%). 더 정확한 값임 |
+| 07-28 | **🐛 `compute_metrics`의 `mdd`가 시작점(누적 PnL 0)을 고점으로 안 잡던 버그 수정 (선재 버그)** | `np.maximum.accumulate(cum)`이 `cum[0]`부터 시작해 **첫 거래부터 손실인 구간의 낙폭이 통째로 누락**됐음(예: pnl=[-50,+100] → 실제 50인데 0으로, [-30,-30,-30] → 90인데 60으로 보고). 같은 파일의 `compound_metrics`는 `peak=start_equity`로 이미 시작점을 고점에 포함하고 있어 **두 MDD 계산이 서로 어긋나 있던 것**이 의도가 아닌 누락이라는 근거. `cum` 앞에 0.0을 붙여 수정. ⚠️ 두 지표는 이름만 비슷할 뿐 별개 — `mdd`는 **고정 100 USDT 진입 기준 누적 PnL 곡선의 절대 낙폭(USDT)**, `mdd_pct`는 **전액 재투입 복리 자본곡선의 % 낙폭**. v9_kpi가 쓰는 건 후자(`compound_mdd_pct`)라 이 수정은 모델 선택에 무영향. 실측 회귀: valid/test × BTC/ETH 4건 모두 값 변화 없음(70.8/129.7/86.2/57.5 그대로) — 기존 런은 초반 하락폭이 최대낙폭에 못 미쳐 잠복 상태였고, 학습 초반 붕괴 체크포인트에서만 값이 달라짐 |
+| 07-28 | **🐛 `ValidationCallback`의 verbose 로그가 죽어 있던 버그 수정 (선재 버그)** | SB3의 `BaseCallback.init_callback()`은 `self.model`만 세팅하고 **`model.verbose`를 콜백에 전파하지 않는데**, `ValidationCallback(args.eval_freq)`가 verbose를 안 넘겨 `self.verbose=0`으로 남아 있었음 → `if self.verbose:` 블록 2개(검증 요약 출력, **"new best" 저장 알림**)가 학습 내내 한 번도 실행되지 않는 죽은 코드였음. best 체크포인트가 언제 갱신됐는지, 혹은 하드게이트에 막혀 한 번도 저장 안 됐는지를 로그만으로 알 수 없었고, 같은 날 도입된 MDD<70 게이트로 **best가 아예 생성되지 않는 런이 가능해지면서** 이 관측 공백이 더 문제가 됨. `def __init__(self, eval_freq, verbose=1)` + `super().__init__(verbose)`로 수정. 스모크로 두 로그 모두 출력 확인 |
 
 ---
 
@@ -316,7 +354,7 @@ m_i = ∏(1 + pnl/100)          # 달력 월 i의 거래들, 월초 자본 1.0 �
 
 - **완익 사전결정 구조의 한계** (`V9 Issue - 완익 사전결정 구조.md`, 미구현): 진입 순간에 완익 목표를 박제 → 보유 기간(수 시간~수 일)의 신규 정보를 전부 버림. 테스트 top1_share 55.2%와 무관하지 않을 가능성. rl 모드(2026-07-20)로 1차 대응했으나 불안정(과매매↔무행동 반복, test 성과 붕괴)이 반복돼 2026-07-21 두 번째 후보안으로 **Revise 모드** 설계 착수 (`V9 Design - Revise Mode.md`, 설계 단계·미구현) — adaptive의 연속 행동공간 표현력은 유지하면서 결정을 주기적으로(예: 10분마다) 재수행. 어떤 안이든 행동 공간이 바뀌어 기존 체크포인트와 비호환.
 - **BTC/ETH 성과 괴리** (`V9 Issue - BTC,ETH괴리잡기.md`, 부분 대응): 동적 레버리지 상한으로 근접청산 격차는 구조적으로 해소했으나, ETH 자체의 수익성 문제는 미해결 — 모델 선택을 BTC 단독으로 돌린 것이 그 방증. ETH는 현재 지표 관찰만 유지.
-- **rl 모드 action masking 미도입** (`V9 Design TODO - Action Masking.md`, 설계 단계·미구현): 상태에 안 맞는 행동(무포지션+Close, 보유중+Enter)이 지금은 조용히 Hold로 흡수돼, entropy_loss가 실제 행동 다양성과 어긋날 수 있고 행동공간 일부가 항상 낭비됨. `sb3-contrib`의 `MaskablePPO` 도입이 후보안 — 우선순위는 낮음(현재 진행 중인 leverage/explore_bonus 실험이 안정화된 뒤 착수 권장, 변수 동시 변경은 원인 격리를 어렵게 만든다는 게 이번 세션 반복 교훈).
+- ~~**rl 모드 action masking 미도입**~~ → **2026-07-27 적용 완료** (아래 6장 이력 참고). `V9 Design TODO - Action Masking.md`의 설계안대로 구현.
 - **입력벡터 정규화 상한 재검토** (`V9 Design TODO - 입력벡터 구성 파라미터 상한 개선.md`, 분석 완료·미적용): `NORM` 딕셔너리 상수 대부분이 실측 분포 대비 너무 느슨하게(BTC p99 기준 28~46%만 사용) 잡혀있어 관측 해상도가 낭비됨 — `wave_scale_max`/`atr_pct_max`/`duration_log_max`/`div_gap_max`(심볼 편차 있음)와 `ret15/1h_atr_clip`(심볼 편차 적음)이 대상. `liq_dist`(관측 22번칸)는 이미 별도로 수정·적용됨(2026-07-24). `upnl_clip`은 leverage 의존적이라 별도 계측 필요.
 - **`sel_monthly_log` 학습중 기록값 vs `eval.py` 재로드 재평가값 불일치 (원인 미확정, 재현 안 됨)**: `leverage=5` 런(0726-1719)에서 1~2회 관측(80M/94.5M 지점, 부호까지 반대). 동일 조건의 `leverage=10` 런(0727-0934)에서 4개 지점 교차검증 시엔 재현 안 됨(6장 07-27 항목 참고) — 일회성 이상 현상으로 잠정 결론, 재발 시 조치. 진단용 `DEBUG_DUMP_TRADES` 덤프 코드는 재현 안 됨을 확인한 뒤 제거함(재발 시 다시 추가해 조사).
 
@@ -325,8 +363,8 @@ m_i = ∏(1 + pnl/100)          # 달력 월 i의 거래들, 월초 자본 1.0 �
 ## <span style="color: #FFA500;">8. 산출물 명명 규칙</span>
 
 - 피처 캐시: `caches/features_v9b_{SYMBOL}[_recent{N}d].npy` + `dist_report_v9b_{SYMBOL}[...].json` (2026-07-20 v9b — 구 `features_v9_*`는 구 체크포인트용 보존)
-- 런 이름: `v9_{ppo|fullctrl}_seed{S}_{MMDD-HHMM}` — **시작 시각(KST, 2026-07-20부터) 포함 유니크 (2026-07-19 도입)**. 이전의 `v9_ppo_seed{S}` 고정 이름은 재시작 시 TB 런 디렉토리·체크포인트가 이전 런 산출물을 덮어쓰는 사고가 있어 폐기. 접두사는 exit_mode가 rl이면 `v9_fullctrl_`(보유 중 풀 컨트롤), 그 외(adaptive/rule)는 `v9_ppo_`(기존 관례 유지) — **세 모드 전부 알고리즘은 PPO로 동일**하고 태그는 환경 모드(exit_mode) 구분용일 뿐이라, 태그를 "rl"로 하면 "ppo" 옆에 나란히 놓였을 때 서로 다른 알고리즘처럼 오인되어 fullctrl로 명명 (2026-07-20). TB 로그 디렉토리는 run_name 그대로 남고 SB3의 자동 run-id 접미사(`_1`)는 커스텀 로거로 억제함(2026-07-20, 이미 타임스탬프로 유니크라 불필요).
-- 모델/로그 저장 경로는 **exit_mode별 폴더로 분리** (2026-07-20, `train.mode_subdir()`): rl은 `v9_fullctrl/`, adaptive/rule은 `v9_adaptive_ppo/`(기존 `v9_ppo_` 파일명 접두사 공유 관례를 폴더 단위로 계승). 세 모드 다 알고리즘은 PPO로 동일 — "fullctrl"은 rl 모드(보유 중 풀 컨트롤)를 "ppo" 옆에 나란히 둘 때 다른 알고리즘처럼 오인되지 않도록 붙인 이름.
+- 런 이름: `v9_{ppo|maskablerl}_seed{S}_{MMDD-HHMM}` — **시작 시각(KST, 2026-07-20부터) 포함 유니크 (2026-07-19 도입)**. 이전의 `v9_ppo_seed{S}` 고정 이름은 재시작 시 TB 런 디렉토리·체크포인트가 이전 런 산출물을 덮어쓰는 사고가 있어 폐기. 접두사는 exit_mode가 rl이면 `v9_maskablerl_`, 그 외(adaptive/rule)는 `v9_ppo_`(기존 관례 유지). 2026-07-20~07-26엔 rl 태그가 `v9_fullctrl_`였음(당시 세 모드 전부 알고리즘이 PPO로 동일해 "환경 모드" 구분용 이름) — 2026-07-27 action masking(`MaskablePPO`) 도입으로 정책 클래스 자체가 달라지고 기존 `v9_fullctrl_*` 체크포인트와 완전 비호환이 되면서 `v9_maskablerl_`로 개명, 신규/구 산출물을 이름부터 명확히 분리 (구 `v9_fullctrl_*`는 과거 기록으로 그대로 보존, 재사용 불가 — 3장 Action Masking 참고). TB 로그 디렉토리는 run_name 그대로 남고 SB3의 자동 run-id 접미사(`_1`)는 커스텀 로거로 억제함(2026-07-20, 이미 타임스탬프로 유니크라 불필요).
+- 모델/로그 저장 경로는 **exit_mode별 폴더로 분리** (2026-07-20, `train.mode_subdir()`): rl은 `v9_maskablerl/`(2026-07-27 개명, 구 `v9_fullctrl/`은 과거 기록 보존), adaptive/rule은 `v9_adaptive_ppo/`(기존 `v9_ppo_` 파일명 접두사 공유 관례를 폴더 단위로 계승).
 - 모델: `models/{mode_subdir}/{run_name}_{steps}_steps.zip` (주기 체크포인트), `..._best.zip` + `..._best_info.json` (검증 best), `..._final.zip` (학습 종료 시점)
 - 로그: `logs/{mode_subdir}/{run_name}/` (TensorBoard — `valid/{SYMBOL}/...` 지표군, `valid/BTC-USDT-SWAP/sel_monthly_log`가 모델 선택 점수 — 2026-07-20부터, 구 태그명 `v9_score_sel` 폐기; `v9_score` 자체도 2026-07-25 완전 폐기). SB3의 자동 run-id 접미사(`_1`)는 커스텀 로거로 억제(2026-07-20). 폐기 런은 `logs_discarded/`(logs/ 밖 별도 최상위 디렉토리)로 이동, 보존 가치가 있으면 구분되는 이름으로 해당 모드 폴더에 유지.
 - 2026-07-20: 기존에 평탄하게 쌓여있던 모델/로그(전부 adaptive 히스토리)를 전부 `v9_adaptive_ppo/`로 일괄 이관 완료 — `models/v9_adaptive_ppo/archive_60d_run/`, `.../backup_run3/`처럼 기존 특수 목적 하위 폴더는 그 안에 중첩 보존.
