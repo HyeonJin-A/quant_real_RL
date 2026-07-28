@@ -273,10 +273,17 @@ def build_callbacks(args, cache_paths, bounds, run_name, env_kwargs):
                             "near_liq_n", "near_liq_pct", "max_upnl"):
                     self.logger.record(f"valid/{sym}/{key}", m[key])
                 # 복리(전액 재투입) 지표 — 실전 운용 방식 기준 참고용 기록 (2026-07-19 추가).
-                # 모델 선택에는 미사용 (선택 기준은 sel_monthly_log 그대로).
+                # 모델 선택에는 compound_mdd_pct만 관여(v9_kpi의 z_mdd 항).
                 cm = compound_metrics(trades, int(ts[lo]), int(ts[hi - 1]))
                 self.logger.record(f"valid/{sym}/compound_multiple", cm["multiple"])
                 self.logger.record(f"valid/{sym}/compound_mdd_pct", cm["mdd_pct"])
+                # 2026-07-28 추가. compound_multiple은 "거래당 엣지 × 거래 횟수"가 뒤섞여 있어
+                # 단독으로는 오해를 부른다(실측: 거래당 엣지가 더 나쁜 쪽이 거래를 61% 더 해서
+                # multiple은 18.6배 높게 표시됨). 아래 둘로 그 두 축을 분리해서 본다:
+                #   monthly_growth      — 달력 시간으로 정규화 (거래 빈도 효과를 정당하게 포함)
+                #   geo_mean_per_trade  — 거래 횟수로 정규화 (순수 엣지 품질, 빈도 효과 제거)
+                self.logger.record(f"valid/{sym}/monthly_growth", cm["monthly_growth"])
+                self.logger.record(f"valid/{sym}/geo_mean_per_trade", cm["geo_mean_per_trade"])
                 if sym == "BTC-USDT-SWAP":
                     # 모델 선택 기준: BTC 월별 복리 log-multiple 평균−표준편차 (2026-07-20).
                     # 근거(0719-1459 런 실측): 구 v9_score(승률×1000 항 지배)는 total_pnl +28

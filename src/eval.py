@@ -329,10 +329,25 @@ def compound_metrics(trades, ts_lo_ms, ts_hi_ms, start_equity=100.0):
         peak = max(peak, equity)
         mdd_pct = max(mdd_pct, (1.0 - equity / peak) * 100.0)
     multiple = equity / start_equity
+    # 2026-07-28: 거래당 기하평균 수익률 — "이 수익률이 매 거래 똑같이 났다면 같은 최종 자본이
+    # 나오는 값". 산술평균(avg_pnl)은 곱셈으로 쌓이는 자본을 재현하지 못한다(예: +50%,-50% →
+    # 산술평균 0%지만 실제로는 100→150→75로 25% 손실, 기하평균 -13.4%가 정답).
+    # 산술평균 ≥ 기하평균이 항상 성립하고 그 차이가 대략 분산의 절반이라(AM-GM),
+    # 기하평균을 쓰면 변동성 손실(volatility drag)이 자동 반영된다.
+    # multiple과 달리 **거래 횟수로 정규화**되므로 "많이 거래해서 배수가 커진 것"과
+    # "거래당 엣지가 좋은 것"을 분리해서 볼 수 있다 (compound_multiple의 핵심 결함 보완).
+    n_tr = len(trades)
+    if n_tr == 0:
+        geo = 0.0
+    elif multiple <= 0.0:
+        geo = -1.0          # 파산 — 유한 횟수로 0에 도달하는 일정 수익률은 -100%뿐
+    else:
+        geo = float(multiple ** (1.0 / n_tr) - 1.0)
     return {
         "start_equity": start_equity,
         "final_equity": float(equity),
         "multiple": float(multiple),                # 최종자본 / 시작자본
+        "geo_mean_per_trade": geo,                  # 거래당 기하평균 수익률 (소수, 0.005 = +0.5%)
         "monthly_growth": float(multiple ** (1.0 / months)) if multiple > 0 else 0.0,  # 월평균 성장 배수
         "mdd_pct": float(mdd_pct),                  # 복리 자본곡선 고점 대비 최대 낙폭 %
         "bankrupt": bankrupt,
@@ -455,7 +470,9 @@ def fmt_compound(cm):
     status = "  ⚠️ BANKRUPT" if cm["bankrupt"] else ""
     return (
         f"  [복리 100 USDT 전액재투입] final={cm['final_equity']:,.1f}  x{cm['multiple']:.2f}"
-        f"  monthly=x{cm['monthly_growth']:.4f}  MDD={cm['mdd_pct']:.1f}%{status}"
+        f"  monthly=x{cm['monthly_growth']:.4f}  MDD={cm['mdd_pct']:.1f}%{status}\n"
+        f"  거래당 기하평균={cm['geo_mean_per_trade']*100:+.4f}%/거래 "
+        f"(거래 횟수 정규화 — multiple과 달리 '많이 거래해서 커진 것'과 무관한 순수 엣지)"
     )
 
 

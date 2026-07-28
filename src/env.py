@@ -89,8 +89,8 @@ NORM = {
     # 타이밍 피처: 수익률을 ATR%로 나눈 "몇 ATR만큼 움직였나" 단위의 클립 상한 (2026-07-20).
     # 원시 %는 종목/레짐 간 변동성 차이로 비교 불가라 ATR 정규화 채택 — 조용한 장의 -0.3%와
     # 폭발장의 -0.3%를 구분. 상수는 v9b 분포 리포트(BTC/ETH p1~p99 커버)로 검증 후 확정.
-    "ret5_atr_clip": 4.7,
-    "ret15_atr_clip": 7.4,
+    "ret5_atr_clip": 3.0,
+    "ret15_atr_clip": 6.0,
     "ret1h_atr_clip": 12.0,
 }
 
@@ -715,9 +715,7 @@ class TradingEnvV9(gym.Env):
     def action_masks(self):
         """2026-07-27: sb3-contrib MaskablePPO용 — 상태에 안 맞는 행동(무포지션+Close,
         보유중+Enter)을 후보에서 물리적으로 제거. rl 모드 전용, {Hold, Enter, Close} 순서
-        (ACT_HOLD/ACT_ENTER/ACT_CLOSE와 동일 인덱스). adaptive/rule은 이 메서드가 호출될
-        일이 없지만(행동공간 자체가 다름 — adaptive는 Box, rule은 Discrete(2)이며 둘 다
-        상태 무관 전부 유효), 방어적으로 호출 시 예외를 낸다."""
+        (ACT_HOLD/ACT_ENTER/ACT_CLOSE와 동일 인덱스)."""
         if self.exit_mode != "rl":
             raise NotImplementedError("action_masks()는 rl 모드 전용입니다.")
         if self.pos_dir == 0:
