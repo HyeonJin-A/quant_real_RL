@@ -359,7 +359,7 @@ class TradingEnvV9(gym.Env):
         episode_len_rows=43200,      # 30일 (2026-07-19 60일 확대 → 2026-07-20 복귀: 60일 런 붕괴 실측, train.py 독스트링 참고)
         decision_stride=1,
         leverage=20.0,
-        fee_rate=0.0005,
+        fee_rate=0.0007,
         exit_mode="rule",
         sl_multiplier=DEFAULT_SL_MULTIPLIER,
         tp_half_level=DEFAULT_TP_HALF_LEVEL,

@@ -6,18 +6,18 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-PORT=6006
+PORT="${1:-6006}"
 CLOUDFLARED="$HOME/.local/bin/cloudflared"
 command -v cloudflared >/dev/null 2>&1 && CLOUDFLARED="$(command -v cloudflared)"
 
 mkdir -p logs
-pkill -f "tensorboard --logdir" 2>/dev/null || true
-pkill -f "cloudflared tunnel" 2>/dev/null || true
+pkill -f "tensorboard.*--port $PORT" 2>/dev/null || true
+pkill -f "cloudflared.*:$PORT" 2>/dev/null || true
 sleep 1
 
-nohup taskset -c 15 venv/bin/tensorboard --logdir logs --port "$PORT" --host 127.0.0.1 \
+nohup taskset -c 3 venv/bin/tensorboard --logdir logs --port "$PORT" --host 127.0.0.1 \
     > logs/tensorboard.out 2>&1 &
-nohup taskset -c 15 "$CLOUDFLARED" tunnel --url "http://localhost:$PORT" --no-autoupdate \
+nohup taskset -c 3 "$CLOUDFLARED" tunnel --url "http://localhost:$PORT" --no-autoupdate \
     > logs/cloudflared.out 2>&1 &
 
 echo "Cloudflare 터널 URL 발급 대기 중..."

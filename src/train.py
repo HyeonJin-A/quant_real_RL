@@ -459,9 +459,9 @@ def main():
                              "--no-dummy-vec으로 기존 SubprocVecEnv 병렬 경로 사용 가능")
     args = parser.parse_args()
     if args.leverage is None and args.exit_mode == "rl":
-        args.leverage = 5.0
+        args.leverage = 3.0
     if args.explore_bonus_start is None:
-        args.explore_bonus_start = 0.005 if args.exit_mode == "rl" else 0.001
+        args.explore_bonus_start = 0.003 if args.exit_mode == "rl" else 0.001
 
     env_kwargs = {"exit_mode": args.exit_mode}
     if args.exit_mode == "rule":
