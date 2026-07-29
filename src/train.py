@@ -378,6 +378,7 @@ def main():
                              "explore_bonus 스케줄이 이미 소진돼 있어 이어붙여도 사실상 안 배움 (2026-07-23)")
     parser.add_argument("--timesteps", type=int, default=100_000_000)
     parser.add_argument("--workers", type=int, default=14)
+    parser.add_argument("--main-core", type=int, default=0, help="메인(부모) 프로세스를 고정할 CPU 코어 번호")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--n-steps", type=int, default=2048, help="PPO 롤아웃 버퍼 크기")
@@ -474,15 +475,15 @@ def main():
     if args.exit_mode == "adaptive" and args.leverage is not None:
         env_kwargs["leverage_max"] = args.leverage
 
-    # 2026-07-25: 메인(부모) 프로세스를 Core 0에 100% 고정 (코어 널뛰기 완벽 방지)
+    # 2026-07-25: 메인(부모) 프로세스를 특정 코어에 100% 고정 (코어 널뛰기 완벽 방지). 2026-07-29: 상수(1) -> --main-core로 파라미터화.
     if hasattr(os, "sched_setaffinity"):
         try:
-            os.sched_setaffinity(0, {0})
+            os.sched_setaffinity(0, {args.main_core})
             num_cpus = os.cpu_count() or 1
             if args.dummy_vec:
-                print(f"[CPU Affinity] Main process -> Core 0 | DummyVecEnv: {args.workers} envs 전부 메인에서 순차 실행 (워커 핀 없음)")
+                print(f"[CPU Affinity] Main process -> Core {args.main_core} | DummyVecEnv: {args.workers} envs 전부 메인에서 순차 실행 (워커 핀 없음)")
             else:
-                print(f"[CPU Affinity] Main process -> Core 0 | {args.workers} workers -> Cores 1~{min(args.workers, num_cpus - 1) if num_cpus > 1 else 0}")
+                print(f"[CPU Affinity] Main process -> Core {args.main_core} | {args.workers} workers -> Cores 1~{min(args.workers, num_cpus - 1) if num_cpus > 1 else 0}")
         except Exception as e:
             print(f"[CPU Affinity] Failed to set affinity: {e}")
 
