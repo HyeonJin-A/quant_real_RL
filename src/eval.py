@@ -120,7 +120,6 @@ def numpy_policy_if_supported(model):
     """정책이 numpy로 정확히 재현 가능한 구조일 때만 NumpyDiscretePolicy를 반환, 아니면 None.
 
     None이면 호출부가 기존 torch `model.predict`로 폴백하므로 동작이 100% 불변이다.
-    - adaptive 모드(Box 연속 액션, 가우시안 평균+클리핑)는 재현 대상에서 제외 → 항상 폴백
     - net_arch/활성함수가 [64,64]+Tanh가 아니거나 features_extractor에 학습 파라미터가
       있으면(예: 향후 CNN/정규화 래퍼 도입) 즉시 폴백 — 조용히 틀린 결과를 내는 것 방지
     """
@@ -144,9 +143,7 @@ def numpy_policy_if_supported(model):
 
 
 def run_policy_on_ranges(model, targets, n_segments=1, decision_stride=1, fee_rate=0.0005,
-                         exit_mode="rule", sl_multiplier=None, tp_half_level=None,
-                         be_trigger_level=None, max_hold_bars=None, leverage=None,
-                         leverage_max=None, use_numpy_policy=True):
+                         max_hold_bars=None, leverage=None, use_numpy_policy=True):
     """여러 독립 레인(심볼)을 한 배치로 동시 롤아웃. targets: [(key, cache_path, lo, hi), ...]
     → {key: trades}
 
@@ -162,16 +159,10 @@ def run_policy_on_ranges(model, targets, n_segments=1, decision_stride=1, fee_ra
     기존 인터페이스 호환용으로만 남겨두며 기본값 1(분할 없음)을 유지할 것.
 
     use_numpy_policy=False면 torch `model.predict` 경로를 강제한다 (A/B/C 파리티 검증용).
-
-    leverage: rule/rl 모드 전용 고정 레버리지. leverage_max: adaptive 모드 전용 레버리지 상한
-    (학습 때 --leverage로 고정 상한 베이스라인을 구성했다면 평가도 반드시 동일 값을 지정할 것
-    — 기본값(전체 범위)과 다르면 정책이 학습 때와 다른 선택 폭/관측을 보게 됨, 2026-07-20).
     """
     env_kwargs = {"decision_stride": decision_stride, "fee_rate": fee_rate,
-                  "fixed_full_range": True, "exit_mode": exit_mode}
-    for key, val in (("sl_multiplier", sl_multiplier), ("tp_half_level", tp_half_level),
-                     ("be_trigger_level", be_trigger_level), ("max_hold_bars", max_hold_bars),
-                     ("leverage", leverage), ("leverage_max", leverage_max)):
+                  "fixed_full_range": True}
+    for key, val in (("max_hold_bars", max_hold_bars), ("leverage", leverage)):
         if val is not None:
             env_kwargs[key] = val
 
@@ -188,7 +179,7 @@ def run_policy_on_ranges(model, targets, n_segments=1, decision_stride=1, fee_ra
                                      end_idx=int(edges[k + 1]), **env_kwargs))
             lane_keys.append(key)
 
-    # 2026-07-27: rl 모드 action masking(MaskablePPO) 지원 — 상태에 안 맞는 행동을
+    # 2026-07-27: action masking(MaskablePPO) 지원 — 상태에 안 맞는 행동을
     # 물리적으로 제거한 채 학습됐으므로, 추론 시에도 동일하게 마스킹해야 학습 때와
     # 같은 유효 행동 후보로 argmax를 계산함 (`V9 Design TODO - Action Masking.md`).
     from sb3_contrib import MaskablePPO
@@ -207,7 +198,6 @@ def run_policy_on_ranges(model, targets, n_segments=1, decision_stride=1, fee_ra
         else:
             actions, _ = predictor.predict(obs_batch, deterministic=True)
         for a_idx, k in enumerate(active):
-            # Discrete(rl/rule)면 스칼라, Box(adaptive)면 6차원 배열 — 둘 다 그대로 전달
             obs, _, _, truncated, _ = envs[k].step(actions[a_idx])
             obs_list[k] = obs
             if truncated:
@@ -222,9 +212,7 @@ def run_policy_on_ranges(model, targets, n_segments=1, decision_stride=1, fee_ra
 
 
 def run_policy_on_range(model, cache_path, lo, hi, n_segments=1, decision_stride=1, fee_rate=0.0005,
-                        exit_mode="rule", sl_multiplier=None, tp_half_level=None,
-                        be_trigger_level=None, max_hold_bars=None, leverage=None, leverage_max=None,
-                        use_numpy_policy=True):
+                        max_hold_bars=None, leverage=None, use_numpy_policy=True):
     """단일 구간 롤아웃 — `run_policy_on_ranges`(복수형)의 1개 타깃 래퍼(기존 시그니처 유지).
 
     기본 n_segments=1 = 세그먼트 분할 없음 (2026-07-19: 16분할 병렬은 경계 강제정산 + 재수렴
@@ -233,10 +221,8 @@ def run_policy_on_range(model, cache_path, lo, hi, n_segments=1, decision_stride
     """
     return run_policy_on_ranges(
         model, [(0, cache_path, lo, hi)], n_segments=n_segments,
-        decision_stride=decision_stride, fee_rate=fee_rate, exit_mode=exit_mode,
-        sl_multiplier=sl_multiplier, tp_half_level=tp_half_level,
-        be_trigger_level=be_trigger_level, max_hold_bars=max_hold_bars,
-        leverage=leverage, leverage_max=leverage_max, use_numpy_policy=use_numpy_policy,
+        decision_stride=decision_stride, fee_rate=fee_rate,
+        max_hold_bars=max_hold_bars, leverage=leverage, use_numpy_policy=use_numpy_policy,
     )[0]
 
 
@@ -271,11 +257,10 @@ def compute_metrics(trades, ts_lo_ms, ts_hi_ms):
     near_liq = int((pnls <= NEAR_LIQUIDATION_THRESHOLD).sum())
     win_rate = len(wins) / len(pnls)
     near_liq_pct = near_liq / len(pnls)
-    # 2026-07-25: upnl_clip(관측 20번칸) 상한 재검토 근거 수집용 참고 지표. rl 모드에서만
+    # 2026-07-25: upnl_clip(관측 20번칸) 상한 재검토 근거 수집용 참고 지표.
     # env._close_position이 채워주는 거래별 "보유 중 관측된 최대 upnl/증거금 배수"(청산가/종가
     # 포함) 전체 중 최댓값 — 최종 실현 손익(top1)과 달리 "그 순간 관측값이 최대 몇 배까지
     # 갔었는가"를 담아, upnl_clip 상한을 몇으로 잡아야 극단값을 놓치지 않는지 판단하는 데 씀.
-    # rule/adaptive 모드 거래엔 이 키가 없어(semi-MDP는 즉시 확정) 0.0으로 처리.
     max_upnl = max((t.get("max_upnl", 0.0) for t in trades), default=0.0)
     return {
         "trades": int(len(pnls)),
@@ -304,8 +289,7 @@ def compound_metrics(trades, ts_lo_ms, ts_hi_ms, start_equity=100.0):
         r = pnl/100은 증거금 규모 불변. 레버리지 상한(MAX_TRADE_LOSS_PCT)도 % 기준이라 동일.
       - semi-MDP라 심볼 내 거래는 겹치지 않음(청산까지 fast-forward) → 순차 재투자 가정이
         정확히 성립. (심볼 간에는 겹칠 수 있으므로 복리 지표는 심볼별로만 산출한다.)
-    equity ≤ 0(파산)은 현행 adaptive에선 거래당 손실 ≤ 20%라 불가능하지만 rule/rl 모드
-    (-100 가능) 방어용으로 처리한다.
+    equity ≤ 0(파산)은 rl 모드에서 거래당 손실이 -100까지 가능하므로 방어용으로 처리한다.
     """
     months = max((ts_hi_ms - ts_lo_ms) / (30.44 * 86400 * 1000), 1e-9)
     equity = start_equity
@@ -480,12 +464,10 @@ def fmt_compound(cm):
 
 def evaluate(model, symbols, split, fee_rate=0.0005, decision_stride=1,
              n_segments=1, cache_suffix="", verbose=True,
-             exit_mode="rule", sl_multiplier=None, tp_half_level=None,
-             be_trigger_level=None, max_hold_bars=None, leverage=None, leverage_max=None,
-             final_split=False):
+             max_hold_bars=None, leverage=None, final_split=False):
     paths = {s: cache_path_for(s, cache_suffix) for s in symbols}
     bounds = split_bounds(list(paths.values()), final=final_split)
-    report = {"split": split, "fee_rate": fee_rate, "exit_mode": exit_mode, "symbols": {}}
+    report = {"split": split, "fee_rate": fee_rate, "symbols": {}}
     all_trades = []
     # 2026-07-28: 심볼별 순차 롤아웃 → 독립 레인 배치 1회 호출 (속도 최적화, 결과 불변)
     targets = []
@@ -497,10 +479,7 @@ def evaluate(model, symbols, split, fee_rate=0.0005, decision_stride=1,
         targets.append((sym, path, lo, hi))
     trades_by_sym = run_policy_on_ranges(model, targets, n_segments=n_segments,
                                          decision_stride=decision_stride, fee_rate=fee_rate,
-                                         exit_mode=exit_mode, sl_multiplier=sl_multiplier,
-                                         tp_half_level=tp_half_level, be_trigger_level=be_trigger_level,
-                                         max_hold_bars=max_hold_bars, leverage=leverage,
-                                         leverage_max=leverage_max)
+                                         max_hold_bars=max_hold_bars, leverage=leverage)
     for sym, path, lo, hi in targets:
         ts = np.load(path)["ts_1m"]
         trades = trades_by_sym[sym]
@@ -550,31 +529,18 @@ def main():
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--segments", type=int, default=1)
     parser.add_argument("--cache-suffix", default="", help="스모크용 캐시 suffix (예: _recent120d)")
-    parser.add_argument("--exit-mode", choices=["rl", "rule", "adaptive"], default="rl",
-                        help="모델 학습 때 쓴 exit_mode와 반드시 일치해야 함 (adaptive=레버리지/손절/반익/완익 전부 정책이 결정, "
-                             "rule=V9 Design.md 9장 Fallback B 전역 고정 청산, rl=보유 중 풀 컨트롤·방향 fade 고정)")
-    parser.add_argument("--sl-multiplier", type=float, default=None)
-    parser.add_argument("--tp-half-level", type=float, default=None)
-    parser.add_argument("--be-trigger-level", type=float, default=None)
     parser.add_argument("--leverage", type=float, default=None,
-                        help="rule/rl 모드 고정 레버리지. 학습 때 --leverage를 지정했다면 반드시 동일 값 지정 "
-                             "(rl 모드는 liq_dist 관측 피처가 leverage에 의존하므로 불일치 시 평가가 왜곡됨)")
-    parser.add_argument("--leverage-max", type=float, default=None,
-                        help="adaptive 모드 레버리지 상한 베이스라인. 학습 때 train.py --leverage를 지정했다면 "
-                             "반드시 동일 값 지정 (예: --leverage-max 1로 학습한 모델은 평가도 1로)")
+                        help="고정 레버리지. 학습 때 --leverage를 지정했다면 반드시 동일 값 지정 "
+                             "(liq_dist 관측 피처가 leverage에 의존하므로 불일치 시 평가가 왜곡됨)")
     parser.add_argument("--out", default=None, help="리포트 JSON 저장 경로")
     parser.add_argument("--final-split", action="store_true",
                         help="배포 전 최종학습용 95/5(train/valid) 분할 기준으로 평가 (test 없음, 2026-07-23)")
     args = parser.parse_args()
 
-    # 2026-07-27: rl 모드는 action masking 도입으로 MaskablePPO 저장 포맷으로 전환됨 —
-    # 기존(masking 이전) rl 체크포인트는 정책 클래스가 달라 호환 안 됨(재학습 필요).
-    if args.exit_mode == "rl":
-        from sb3_contrib import MaskablePPO
-        model = MaskablePPO.load(args.model, device="cpu")
-    else:
-        from stable_baselines3 import PPO
-        model = PPO.load(args.model, device="cpu")
+    # 2026-07-27: action masking 도입으로 MaskablePPO 저장 포맷으로 전환됨 —
+    # 기존(masking 이전) 체크포인트는 정책 클래스가 달라 호환 안 됨(재학습 필요).
+    from sb3_contrib import MaskablePPO
+    model = MaskablePPO.load(args.model, device="cpu")
 
     if args.split == "test":
         if args.final_split:
@@ -583,10 +549,7 @@ def main():
 
     report = evaluate(model, args.symbols, args.split, fee_rate=args.fee,
                       decision_stride=args.stride, n_segments=args.segments,
-                      cache_suffix=args.cache_suffix,
-                      exit_mode=args.exit_mode, sl_multiplier=args.sl_multiplier,
-                      tp_half_level=args.tp_half_level, be_trigger_level=args.be_trigger_level,
-                      leverage=args.leverage, leverage_max=args.leverage_max,
+                      cache_suffix=args.cache_suffix, leverage=args.leverage,
                       final_split=args.final_split)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
