@@ -75,6 +75,7 @@ import os
 import sys
 import json
 import argparse
+from collections import deque
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -141,7 +142,7 @@ def make_env_fn(cache_path, lo, hi, episode_len_rows, decision_stride, seed, env
 
 def build_callbacks(args, cache_paths, bounds, run_name, env_kwargs):
     from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
-    model_dir = os.path.join(MODEL_DIR, mode_subdir(args.exit_mode))
+    model_dir = os.path.join(MODEL_DIR, mode_subdir(args.exit_mode), run_name)
     os.makedirs(model_dir, exist_ok=True)
 
     class EntCoefSchedule(BaseCallback):
@@ -234,11 +235,16 @@ def build_callbacks(args, cache_paths, bounds, run_name, env_kwargs):
         # 그 결과 아래 `if self.verbose:` 블록 두 개(검증 요약 출력, "new best" 저장 알림)가
         # 학습 내내 한 번도 실행되지 않는 죽은 코드였음 — best 체크포인트가 언제 갱신됐는지
         # (혹은 하드게이트에 막혀 한 번도 저장 안 됐는지) 로그만 봐서는 알 수 없었다.
-        def __init__(self, eval_freq, verbose=1):
+        def __init__(self, eval_freq, kpi_smooth_window=3, verbose=1):
             super().__init__(verbose)
             self.eval_freq = eval_freq
             self.last_eval = 0
             self.best_score = -np.inf
+            # 2026-07-29: best 선택에 쓰는 v9_kpi를 원시값 대신 최근 N회 이동평균으로 교체 —
+            # 단일 체크포인트의 우연한 스파이크가 실제로는 더 꾸준했던 인접 구간을 근소 차이로
+            # 이겨버리는 문제 실측 확인(0729-1938 런: 73M 스파이크 1.367이 95.5~96.0M의
+            # 연속 우수 구간(1.1대, sel/mdd 둘 다 73M보다 좋음)을 제치고 best로 선택됨).
+            self.kpi_history = deque(maxlen=kpi_smooth_window)
 
         def _on_step(self):
             if self.num_timesteps - self.last_eval < self.eval_freq:
@@ -323,24 +329,32 @@ def build_callbacks(args, cache_paths, bounds, run_name, env_kwargs):
                 # 항별 기여 분해 — 어느 축이 점수를 끌어올리고/깎고 있는지 TB에서 바로 보기 위함
                 for k, v in btc_kpi_z.items():
                     self.logger.record(f"valid/BTC-USDT-SWAP/v9_kpi_z_{k}", v)
-                if btc_eligible and btc_kpi > self.best_score:
-                    self.best_score = btc_kpi
+                # 2026-07-29: best 비교는 원시 v9_kpi가 아니라 최근 N회(kpi_history) 이동평균으로
+                # 수행 — 고립된 스파이크 1회보다 꾸준히 높았던 구간을 우대. 자격 게이트(거래수/
+                # 근접청산/MDD)는 여전히 "현재 시점" 기준으로 적용(과거 실격 구간이 지금 좋아졌다고
+                # 그 흔적만으로 통과시키지 않음).
+                self.kpi_history.append(btc_kpi)
+                smoothed_kpi = float(np.mean(self.kpi_history))
+                self.logger.record("valid/BTC-USDT-SWAP/v9_kpi_smoothed", smoothed_kpi)
+                if btc_eligible and smoothed_kpi > self.best_score:
+                    self.best_score = smoothed_kpi
                     path = os.path.join(model_dir, f"{run_name}_best")
                     self.model.save(path)
                     with open(path + "_info.json", "w", encoding="utf-8") as f:
                         json.dump({"timesteps": self.num_timesteps,
                                    "btc_v9_kpi": round(btc_kpi, 4),
+                                   "btc_v9_kpi_smoothed": round(smoothed_kpi, 4),
                                    "btc_v9_kpi_z": {k: round(v, 4) for k, v in btc_kpi_z.items()},
                                    "btc_sel_monthly_log": round(btc_sel, 4),
                                    "btc_compound_mdd_pct": round(btc_mdd_pct, 2),
                                    "btc_max_single_loss": round(btc_msl, 2),
                                    "btc_monthly_multiples": [round(float(np.exp(l)), 3) for l in btc_logs_m]}, f)
                     if self.verbose:
-                        print(f"[valid] new best (BTC v9_kpi {btc_kpi:+.4f} | sel {btc_sel:+.4f} "
-                              f"mdd {btc_mdd_pct:.1f}% msl {btc_msl:+.1f}) -> {path}.zip")
+                        print(f"[valid] new best (BTC v9_kpi {btc_kpi:+.4f}, smoothed {smoothed_kpi:+.4f} | "
+                              f"sel {btc_sel:+.4f} mdd {btc_mdd_pct:.1f}% msl {btc_msl:+.1f}) -> {path}.zip")
             return True
 
-    callbacks = [EntCoefSchedule(), ValidationCallback(args.eval_freq)]
+    callbacks = [EntCoefSchedule(), ValidationCallback(args.eval_freq, kpi_smooth_window=args.kpi_smooth_window)]
     if args.exit_mode == "adaptive":
         # log_std 클램프는 adaptive 전용 개념 — rl 모드는 Discrete(이산) 행동이라 log_std
         # 자체가 없음(폭주 위험 없음).
@@ -394,6 +408,10 @@ def main():
                              "더 나빠 30일로 원복 — 다만 그 런엔 explore_bonus(0.15)도 그대로 남아있어 원인이 "
                              "완전히 격리되진 않음 (6장 이력 참고)")
     parser.add_argument("--eval-freq", type=int, default=500_000)
+    parser.add_argument("--kpi-smooth-window", type=int, default=3,
+                        help="best 체크포인트 선택에 쓰는 v9_kpi 이동평균 윈도(검증 회차 수, 기본 3). "
+                             "단일 검증 스냅샷의 우연한 스파이크가 근소한 차이로 연속 우수 구간을 이기는 "
+                             "문제 대응 (2026-07-29) — 최근 N회 v9_kpi의 평균이 best_score보다 높을 때만 갱신")
     parser.add_argument("--eval-segments", type=int, default=1)  # 2026-07-19: 세그먼트 분할 폐기 (경계 오차)
     parser.add_argument("--checkpoint-freq", type=int, default=1_000_000)
     parser.add_argument("--ent-coef-start", type=float, default=0.01,
@@ -569,7 +587,7 @@ def main():
     callbacks = build_callbacks(args, cache_paths, bounds, run_name, env_kwargs)
     model.learn(total_timesteps=args.timesteps, callback=callbacks)
 
-    final_path = os.path.join(MODEL_DIR, log_subdir, f"{run_name}_final")
+    final_path = os.path.join(MODEL_DIR, log_subdir, run_name, f"{run_name}_final")
     model.save(final_path)
     print(f"final model saved: {final_path}.zip")
     vec_env.close()

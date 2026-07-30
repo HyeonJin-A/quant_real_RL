@@ -391,7 +391,8 @@ def monthly_sel_score(trades, ts_lo_ms, ts_hi_ms):
 # v9_kpi — best 체크포인트 선택 점수 (2026-07-28 도입, sel_monthly_log 단독 기준 대체)
 #
 # 안정성 최우선 요구에 따라 수익성(sel_monthly_log) + 낙폭(compound_mdd_pct) +
-# 꼬리위험(max_single_loss) 세 축을 4:3:3으로 합성한다.
+# 꼬리위험(max_single_loss) 세 축을 6:2:2로 합성한다 (2026-07-29: 4:3:3→6:2:2, 수익성
+# 비중을 60%로 상향 — mdd:msl 상대 비율은 유지한 채 sel만 올림).
 #
 # ⚠️ 아래 상수는 절대 바꾸지 말 것 (바꾸면 과거 런과 점수 비교 불가):
 #   ValidationCallback은 `v9_kpi > best_score`로 **학습 초반 점수와 후반 점수를 비교**해
@@ -403,21 +404,22 @@ def monthly_sel_score(trades, ts_lo_ms, ts_hi_ms):
 #   pooled std — sel_monthly_log 0.516 / compound_mdd_pct 17.1 / max_single_loss 12.1
 #   → 이 산포로 나눠야 세 항이 실제로 대등해진다. "값의 범위"(0~100 vs ±1.5)로 맞추면 틀림.
 #   IQR 기준도 검토했으나 max_single_loss의 꼬리가 두꺼워(min -81.3) 혼자 분산의 50.7%를
-#   차지해버려 기각. std 기준 + 4:3:3 가중 시 실측 분산기여 sel 37.0% / mdd 31.8% / msl 31.2%.
+#   차지해버려 기각. std 기준 + 4:3:3 가중 시 실측 분산기여 sel 37.0% / mdd 31.8% / msl 31.2%
+#   (2026-07-29 6:2:2로 재조정, 분산기여 재실측은 아직 없음 — 가중치만 사용자 지시로 변경).
 # 중심값(0 / 70 / -30)은 순위에 영향 없는 단순 오프셋 — v9_kpi≈0이 "평범한 체크포인트",
 #   +1이 "종합 1σ 우수"로 읽히게 하는 해석 편의용.
 # 주의: sel_monthly_log(−std 항)·compound_mdd_pct·max_single_loss는 서로 독립이 아니다
-#   (실측 상관 sel↔mdd +0.76, sel↔msl +0.24, mdd↔msl +0.52). 즉 4:3:3은 "세 축 균등"이
-#   아니라 [수익·낙폭] 축에 무게가 실린 구성 — 안정성 우선 의도에 부합해 채택한 것.
+#   (실측 상관 sel↔mdd +0.76, sel↔msl +0.24, mdd↔msl +0.52). 6:2:2는 원래 4:3:3(세 축
+#   균등이 아니라 [수익·낙폭] 축에 무게가 실린 구성)에서 수익성 비중을 한 단계 더 올린 것.
 V9_KPI_CENTER = {"sel": 0.0, "mdd": 70.0, "msl": -30.0}
 V9_KPI_SCALE = {"sel": 0.50, "mdd": 17.0, "msl": 12.0}
-V9_KPI_WEIGHT = {"sel": 4.0, "mdd": 3.0, "msl": 3.0}
+V9_KPI_WEIGHT = {"sel": 6.0, "mdd": 2.0, "msl": 2.0}
 MAX_COMPOUND_MDD_PCT = 70.0   # best 후보 자격 하드게이트 (2026-07-28) — 이 이상은 실전 부적합
 
 
 def v9_kpi(sel_monthly_log, compound_mdd_pct, max_single_loss, detail=False):
     """best 체크포인트 선택 점수 (높을수록 좋음). 세 지표 전부 "높을수록 좋음"으로 방향을
-    맞춘 뒤 고정 상수로 정규화해 4:3:3 가중 평균한다 (위 상수 블록 주석 참고).
+    맞춘 뒤 고정 상수로 정규화해 6:2:2 가중 평균한다 (위 상수 블록 주석 참고).
 
     compound_mdd_pct는 낮을수록, max_single_loss는 0에 가까울수록 좋으므로 부호를 뒤집는다.
     detail=True면 항별 기여도를 함께 반환 (진단용, 선택 로직엔 미사용).
@@ -523,7 +525,7 @@ def evaluate(model, symbols, split, fee_rate=0.0005, decision_stride=1,
                             and m["near_liq_n"] == 0
                             and cm["mdd_pct"] < MAX_COMPOUND_MDD_PCT) else "탈락"
             print(f"  [v9_kpi] {kpi:+.4f}  (sel {kpi_z['sel']:+.2f} / mdd {kpi_z['mdd']:+.2f} / "
-                  f"msl {kpi_z['msl']:+.2f}, 가중 4:3:3)  best후보 게이트: {gate}")
+                  f"msl {kpi_z['msl']:+.2f}, 가중 6:2:2)  best후보 게이트: {gate}")
             print(f"  acceptance: {acc}")
             print(f"  yearly: { {y: round(v['pnl'], 1) for y, v in yearly_breakdown(trades).items()} }")
 
