@@ -1,0 +1,43 @@
+{
+  "resume_from": "/home/henjigcp/git/quant_real_RL/models/best/v9_maskablerl_seed0_0728-1924_best.zip",
+  "resume_start_step": 96001920,
+  "git_commit": "7dea1bf4b2c65d242921aede597b61db21303dcc",
+  "args": {
+    "resume_from": "models/best/v9_maskablerl_seed0_0728-1924_best.zip",
+    "timesteps": 300000000,
+    "schedule_ref_total": 100000000,
+    "lr_knee_step": 96000000,
+    "lr_knee_value": null,
+    "resume_reset_best": false,
+    "seed_best_info": "models/best/v9_maskablerl_seed0_0728-1924_best_info.json",
+    "symbols": [
+      "BTC-USDT-SWAP",
+      "ETH-USDT-SWAP"
+    ],
+    "leverage": 3.0,
+    "episode_days": 30,
+    "stride": 1,
+    "n_steps": 2048,
+    "batch_size": 512,
+    "workers": 14,
+    "final_split": false,
+    "main_core": 0,
+    "seed": 0,
+    "n_epochs": 10,
+    "gamma": 0.999,
+    "gae_lambda": 0.95,
+    "clip_range": 0.2,
+    "vf_coef": 0.5,
+    "eval_freq": 500000,
+    "kpi_smooth_window": 3,
+    "eval_segments": 1,
+    "checkpoint_freq": 1000000,
+    "ent_coef_start": 0.01,
+    "ent_coef_end": 0.005,
+    "ent_coef_hold_frac": 0.7,
+    "explore_bonus_start": 0.005,
+    "explore_bonus_decay_frac": 0.5,
+    "cache_suffix": "",
+    "dummy_vec": true
+  }
+}

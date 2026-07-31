@@ -4,7 +4,7 @@
 
 현재 아키텍처는 **`rl` 모드(보유 중 풀 컨트롤)** 단일 모드입니다: 정책이 매 1분 행마다 Hold/Enter/Close를 직접 결정하고, 보상은 매 스텝 mark-to-market 손익 변화량(dense reward)입니다. 초기 설계(`V9 Design.md`)의 풀 컨트롤은 2026-07-16 "아무것도 안 함" 붕괴로 한 차례 폐기됐었으나, 2026-07-20 재설계(방향 fade 고정 + explore_bonus 이식)로 재도전해 현재 주력 모드로 자리잡았습니다. 과거 레거시였던 `adaptive`(semi-MDP, 진입 시 레버리지/손절/반익/완익 전부 확정)와 `rule`(V8 엔진 고정 청산) 모드는 **2026-07-30 코드에서 완전히 제거**됐습니다 — `exit_mode` 개념 자체가 사라지고 `env.py`/`train.py`/`eval.py`는 이제 `rl` 모드만 지원합니다. 본 문서가 현행 사양의 기준입니다.
 
-*최종 갱신: 2026-07-30*
+*최종 갱신: 2026-07-31*
 
 ---
 
@@ -22,6 +22,7 @@ quant_real_RL/
 │   ├── prep_features.py     # 1m 행 단위 인과적 피처 캐시 생성기
 │   ├── env.py               # TradingEnvV9 (Gymnasium, rl 모드 단일 — 보유 중 풀 컨트롤)
 │   ├── train.py             # SB3 PPO 학습 + 커리큘럼/안정화 콜백
+│   ├── train_resume.py      # 이어학습 전용 (2026-07-31 신설, train.py 등 기존 소스 무수정)
 │   └── eval.py              # 백테스트 하네스 (70/15/15 분할, 합격 기준 판정)
 ├── V9 Design.md             # 초기 설계서 (풀 컨트롤 시절 — 역사 참고용)
 ├── V9 Issue - *.md          # 미해결 이슈 노트 (7장 참조)
@@ -159,6 +160,53 @@ quant_real_RL/
 
 - ⚠️ 커리큘럼 갱신은 반드시 `VecEnv.env_method("set_curriculum", ...)` 사용 — `set_attr`은 Monitor 래퍼 표면에 그림자 속성만 만들고 내부 env에 안 닿는 SB3 버그 있음 (2026-07-17 실측 확인).
 - 사용법: `python src/train.py --seed 0` (스모크: `--timesteps 30000 --workers 2 --dummy-vec --cache-suffix _recent120d`)
+
+### <span style="color: #2E8B57;">이어학습 (`train_resume.py`, 2026-07-31 신설)</span>
+베이스라인의 valid 지표가 `--timesteps`(기본 100M) 도달 시점에도 상승 곡선이라 더 학습할
+여지가 있으나, lr 스케줄이 정확히 그 지점에서 0으로 수렴하도록 짜여 있어(위 표) 그냥
+이어 돌리면 사실상 학습이 안 됨. 이 문제를 다루는 전용 스크립트를 신설했고, **`train.py`/
+`env.py`/`eval.py`/`algorithm.py`/`prep_features.py`는 한 글자도 수정하지 않음** — 이미
+신뢰받는 fresh-run 경로가 드물게 쓰이는 실험적 resume 경로 때문에 영향받을 위험을
+원천 차단하기 위함(`V9 Design TODO - Resume 학습 지원.md` 참고).
+
+| 개념 | 의미 |
+|---|---|
+| `T_end` (`--timesteps`) | 학습이 실제로 멈추는 새 절대 스텝 (예: 300M) |
+| `T_ref` (`--schedule-ref-total`) | ent_coef/explore_bonus의 `*_frac` 계산 기준이 되는 원 런 총스텝 (보통 원래 `--timesteps`, 예: 100M 그대로 유지 — 이미 끝난 스케줄을 그대로 보존) |
+| lr 스케줄 | `--lr-knee-step` 이전 구간은 원 스케줄(`LR_START*(1-t/T_ref)`)을 그대로 재현하고, 그 지점의 lr을 기준으로 `T_end`까지 다시 선형 0-수렴 (piecewise) |
+
+`train.py`의 `args.timesteps` 참조가 전부 `build_callbacks()` 내부(ent_coef/explore_bonus
+계산 3곳)에만 있다는 점을 이용해, `build_callbacks()`는 원본 그대로 import해 쓰되
+`.timesteps`만 `T_ref`로 바꿔치기한 얕은 복사본을 넘겨서 소스 수정 없이 스케줄 기준을
+분리함. `ValidationCallback`의 `best_score`/`kpi_history`는 zip에 저장되지 않아 복원이
+안 되므로, `--seed-best-info`로 원 체크포인트의 `_best_info.json`을 넘기면 저장된
+`btc_sel_monthly_log`/`btc_compound_mdd_pct`/`btc_max_single_loss`를 **현재 `v9_kpi`
+가중치로 재계산**해 시드값으로 사용(원 파일의 `btc_v9_kpi` 원시값은 가중치 변경 이력이
+있어 그대로 못 씀).
+
+필수 인자는 `--resume-from`/`--seed-best-info` 둘뿐 (2026-07-31 변경) — `leverage`
+(기본 3.0)/`episode_days`(30)/`stride`(1)/`n_steps`(2048)/`batch_size`(512)/`workers`(14)/
+`symbols`(BTC+ETH)/`timesteps`(300M)/`schedule_ref_total`(100M)/`lr_knee_step`(90M)는
+전부 `models/best/v9_maskablerl_seed0_0728-1924_best.zip` 베이스라인의 실제 학습
+설정 기준 기본값을 가짐(leverage=3.0은 `quant_main`의 「RL 실전-백테스트 괴리 점검」
+문서 + 커밋 `e83032f` 코드 해석으로 교차 확인). **다른 체크포인트를 resume할 땐 이
+기본값들을 그 런의 실제 설정으로 반드시 override**해야 함 — 특히 `leverage` 등
+env 영향 인자는 obs shape이 그대로라 어긋나도 에러 없이 조용히 잘못 학습됨.
+
+**저장 경로** (2026-07-31): fresh-run 트리(`models|logs/v9_maskablerl/{run_name}`)와
+분리해 `models|logs/resume/{원본 체크포인트 run_name}/{이번 resume run_name}/`에
+저장 — 같은 원본에서 나온 여러 resume 시도가 한곳에 모인다. `build_callbacks()`가
+저장 경로를 내부에서 직접 계산해 인자로 못 바꾸는 부분은, `train.py` 소스는 그대로
+둔 채 임포트한 모듈 객체의 `MODEL_DIR`/`MODE_SUBDIR` 전역값을 이 프로세스 안에서만
+런타임에 패치해 우회함(디스크의 `train.py`는 무수정).
+
+사용법 예 (0728-1924 베이스라인 resume, 최소):
+```
+python src/train_resume.py --resume-from models/best/v9_maskablerl_seed0_0728-1924_best.zip \
+  --seed-best-info models/best/v9_maskablerl_seed0_0728-1924_best_info.json
+```
+스모크(`--cache-suffix _recent120d`, 소규모 timesteps)로 로드→피스와이즈 lr 계산→
+resume 즉시 검증→학습 재개→저장까지 전체 경로 동작 확인 완료 (2026-07-31).
 
 ---
 
