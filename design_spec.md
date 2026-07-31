@@ -58,10 +58,16 @@ quant_real_RL/
   | XRP-USDT-SWAP | 4 | 0.04 | (2026-07-23, 파라미터만 등록 — 원본 데이터 미보유로 캐시는 아직 미생성) |
   | (그 외 폴백) | 8 | 0.02 |
 
-### <span style="color: #2E8B57;">피처 캐시 (`features_v9b_{SYMBOL}.npy`, 행당 25컬럼 — 2026-07-20 v9b)</span>
+### <span style="color: #2E8B57;">피처 캐시 (`features_v9c_{SYMBOL}.npy`, 행당 25컬럼 — 2026-07-31 v9c)</span>
+- **v9c (2026-07-31)**: RSI 다이버전스 3컬럼을 **임의 상수 없는 "모멘텀 천장" 방식**으로 재설계 (`algorithm.calc_rsi_divergence`). 컬럼 교체: `has_rsi_divergence`/`rsi_previous`/`divergence_price_gap_percent` → **`div_rsi_gap`/`dist_from_div_peak_to_end`/`div_price_gap`**. 총 컬럼 수(25)와 관측 차원(18)은 불변.
+  - **정의**: 파동 `[a_p2, a_p1]` 내에서 `j* = argmax(RSI)`(상승 파동) / `argmin(RSI)`(하락). `div_rsi_gap` = RSI 극값 − 파동 끝 RSI (≥0, **0이면 모멘텀이 가격과 동시에 정점 = 확인(confirmation)**, 클수록 모멘텀이 먼저 꺾인 뒤 가격만 진행 = 다이버전스). `dist_from_div_peak_to_end` = RSI 극점→파동 끝 거리(일 단위, `wave_duration_day`와 동일 단위·동일 정규화). `div_price_gap` = RSI 극점 이후 가격 추가 이동폭(%). 세 값이 각각 **모멘텀 크기 / 타이밍 / 가격** 축을 담당해 서로 직교.
+  - **왜 피크 탐색을 버렸나**: 파동 길이 중앙값이 BTC 14봉·ETH 26봉·SOL 18봉(=70분 수준)에 불과해, **파동 내부에 되돌림으로 분리된 두 개의 스윙 고점이 존재하지 않는 경우가 대부분**. 고전적 2-피크 다이버전스는 이 스코프에서 구조적으로 성립 불가라 argmax/argmin 기반으로 재정의함. 파동 끝 극점의 가격은 정의상 파동 내 가격 극값이므로 "higher high" 조건이 항상 자동 충족 → 신호가 순수 RSI 비교로 환원되며, 가격 조건 검사가 불필요해짐.
+  - **제거된 임의 상수 4종**: 후보 상위 10개(`nlargest(10)`), 최소 캔들 간격 5, RSI 임계값 70/30, prev1/prev2 OR 판정. 특히 최소 캔들 간격 5는 **BTC 파동의 21.1%를 계산 전에 탈락**시키고(파동 ≤5봉이면 후보 구간 공백) 같은 상수가 ETH에선 8.5%만 탈락시켜 **심볼 간 비대칭**까지 만들고 있었음 — 봉 개수 단위 상수가 피봇 파라미터(`min_diff`)와 통제되지 않게 상호작용한 결과라, 값 튜닝이 아니라 단위 자체를 폐기.
+  - **부수 효과**: 0/1 플래그가 사라져 "미발생 시 `rsi_previous=50.0`" 센티넬과 불연속이 소멸(셋 다 상시 유효한 연속값). `rsi_previous`를 관측에서 뺀 이유는 파동 끝 RSI가 대부분 `rsi_now`와 같은 값이라 `(rsi_now, div_rsi_gap)`에서 복원 가능한 **순수 중복**이었기 때문 — 그 자리에 축이 다른 `div_price_gap`을 넣음. 성능도 개선(pandas `nlargest`+`sort_values`+`idxmax` 체인 → numpy `argmax` 1회).
+  - 구 v9b/v9 캐시는 구 체크포인트 참조용으로 보존.
 - **v9b (2026-07-20)**: 타이밍 피처 4컬럼 추가 — `rsi_now`(직전 마감 5m RSI), `ret_5m/ret_15m/ret_1h`(1m 종가 트레일링 수익률). 구 v9 캐시(21컬럼)와 비호환이라 파일명 분리, 구 캐시는 구 체크포인트 참조용으로 보존.
 - 5m 파동을 1m 스냅샷에 매핑. **매 1m 행은 그 시점에 실시간으로 알 수 있었던 정보만 포함** (인과성 보장): forming 캔들 극값 추적, 피봇 확정 지연(`index ≤ idx_5m − n`), 지표는 직전 마감 5m 캔들 기준.
-- 주요 컬럼: 파동 방향/시작·끝 가격/스케일/지속시간, RSI 다이버전스(발생 플래그 + rsi_previous + 가격 갭), relative_volume_strength(트레일링 500캔들 min-max 백분위 — V8의 0.0 하드코딩 버그 수정판), volatility_ratio, adx_5m/atr_5m(RMA 방식), fib_pos(파동 내 되돌림 위치), pre_hit_0382(0.382 선터치 플래그), wave_age_min.
+- 주요 컬럼: 파동 방향/시작·끝 가격/스케일/지속시간, RSI 다이버전스 3종(`div_rsi_gap` + `dist_from_div_peak_to_end` + `div_price_gap`, `algorithm.calc_rsi_divergence()` 기반), relative_volume_strength(트레일링 500캔들 min-max 백분위 — V8의 0.0 하드코딩 버그 수정판), volatility_ratio, adx_5m/atr_5m(RMA 방식), fib_pos(파동 내 되돌림 위치), pre_hit_0382(0.382 선터치 플래그), wave_age_min.
 - 캐시 생성 시 심볼별 **피처 분포 리포트**(퍼센타일 표 JSON)를 함께 저장 — 정규화 클립 상수가 BTC/ETH 분포를 커버하는지 검증용.
 - 사용법: `python src/prep_features.py --symbols BTC-USDT-SWAP ETH-USDT-SWAP` (스모크: `--recent-days 120`)
 
@@ -85,9 +91,9 @@ quant_real_RL/
 |---|---|---|
 | 1 | wave_scale_percent | clip 0~12% → /12 |
 | 2 | wave_duration_day | log1p, clip 0~10일 |
-| 3 | has_rsi_divergence | 0/1 |
-| 4 | 방향조정 RSI (`rsi if bullish else 100−rsi`) | /100 |
-| 5 | divergence_price_gap_percent | clip 0~5% → /5 |
+| 3 | div_rsi_gap (RSI 극값 − 파동 끝 RSI) | clip 0~45pt → /45 |
+| 4 | dist_from_div_peak_to_end | log1p, clip 0~10일 (2번과 동일 정규화) |
+| 5 | div_price_gap | clip 0~5% → /5 |
 | 6 | volatility_ratio | log1p, clip 0~6 |
 | 7 | relative_volume_strength | clip 0~1 |
 | 8 | adx_5m | /100 |
@@ -393,6 +399,7 @@ sel_monthly_log = mean(ln m_i) − std(ln m_i)    # BTC 검증 ~12개월
 | 07-29 | **학습 수수료 0.0007→0.0009 실험 → 원복** | 재학습 런(0729-1336) best 스냅샷은 v9_kpi가 베이스라인과 거의 동급(-1.1%)처럼 보였으나, best가 68.5M(학습 후반 미도달 지점)에서 나온 것이었고 100M 종료 시점 v9_kpi는 0.858로 베이스라인(1.380)보다 뚜렷이 낮음 — 후반부 트렌드 자체가 나쁨(sel_monthly_log -16%, msl 표준편차 4배 증가). 0.0007로 원복 |
 | 07-29 | **best 선택 기준 v9_kpi 가중 4:3:3→6:2:2(수익성 60%) + 이동평균 스무딩(`--kpi-smooth-window` 기본 3) 추가** | 사용자 지시. 계기: 수수료 실험과 별개로 진행한 0729-1938 런(변경된 설정 미상 — 로그에 argv가 안 남아 원인 특정 불가) 검토 중, best로 뽑힌 73M 지점이 단발성 스파이크(v9_kpi=1.367, 전후 체크포인트는 0.7~0.9대)였고, 95.5~96.0M 구간(연속 2회 1.1대 유지, sel_monthly_log·MDD 둘 다 73M보다 우수)이 근소한 차이로 밀린 것을 확인 — 고립된 스파이크가 꾸준히 좋았던 구간을 이기는 선택 방식의 문제로 진단. `ValidationCallback`이 원시 v9_kpi 대신 최근 N회 이동평균을 `best_score`와 비교하도록 변경(자격 게이트는 현재 시점 기준 유지). 가중치는 수익성 비중을 40%→60%로 상향(mdd:msl 상대비율 1:1 유지). 스모크 테스트(2만 스텝, window=2) 통과 — `v9_kpi`/`v9_kpi_smoothed` 정상 기록 확인. ⚠️ 소급 재검증(과거 런 best 재선택 결과)은 미실시 — 다음 재학습부터 적용 |
 | 07-30 | **레거시 `adaptive`/`rule` 모드 구현 코드 완전 제거** | 사용자 지시 — rl 모드가 유일한 실사용 모드로 확정된 지 오래라 죽은 코드를 정리. `env.py`: `simulate_adaptive_exit`/`simulate_v8_exit`/`dynamic_leverage_ceiling` 함수, `ADAPTIVE_ACTION_DIM`/`LEVERAGE_RANGE`/`SL_MULTIPLIER_RANGE`/`TP_HALF_RANGE`/`TP_FULL_EXTRA_RANGE`/`MAX_TRADE_LOSS_PCT` 등 전용 상수, `_step_rule`/`_step_adaptive` 메서드, 생성자의 `exit_mode`/`sl_multiplier`/`tp_half_level`/`be_trigger_level`/`leverage_max` 인자를 전부 삭제 — `action_space`/`observation_space`/`step()`이 이제 rl 모드 하나로 무조건 고정. `train.py`: `LogStdClampCallback`/`LeverageMaxSchedule` 콜백과 그 전용 CLI 인자(`--log-std-min/-max`, `--leverage-max-start/-full`, `--leverage-curriculum-frac`), `--exit-mode`/`--sl-multiplier`/`--tp-half-level`/`--be-trigger-level` 삭제, `mode_subdir()`→`MODE_SUBDIR` 상수로 단순화, `PPOClass` 분기 제거하고 `MaskablePPO` 고정. `eval.py`: `exit_mode`/`sl_multiplier`/`tp_half_level`/`be_trigger_level`/`leverage_max` 관련 파라미터 전부 삭제. `EntCoefSchedule`/`ExploreBonusSchedule`/`ValidationCallback`(v9_kpi 계산·TB 로깅·자격 게이트 3종 포함)은 rl 모드에서도 그대로 쓰이므로 **한 글자도 안 건드림**. 스모크 테스트(2만 스텝, `--dummy-vec --cache-suffix _recent120d`)로 학습·검증·체크포인트 저장·`eval.py` 재로드 전 경로 정상 동작 확인 — TB에 `v9_kpi`/`v9_kpi_z_*`/`compound_mdd_pct` 등 기존 지표 전부 정상 기록됨을 재확인. 배경에서 돌던 기존 학습 프로세스(`v9_maskablerl_seed0_0730-0342`, 03:41 시작)는 이미 메모리에 구버전 코드가 로드돼 있어 이번 변경의 영향을 받지 않음(재시작 시에만 새 코드 적용). ⚠️ 1차 시도에서 `env.py`의 관측 공간을 22→26차원으로 바꾸는 등 스코프를 벗어난 재작성이 섞여 들어갔던 것을 사용자가 발견해 롤백 후 재작업 — 이번엔 삭제만 하고 rl 모드 로직은 전혀 손대지 않았음을 매 파일 diff로 확인 |
+| 07-31 | **RSI 다이버전스 전면 재설계 — 임의 상수 4종 제거, 캐시 v9b→v9c (2장 상세)** | 2단계로 진행. **(1차)** 구 로직(`a_p3` 비교)이 가격 갭(먼 과거 극점)과 RSI(직전 마감봉)를 **서로 다른 캔들에서 읽어** 비교하는 근본 결함 확인 — 되돌림 깊이(`fib_pos`)와 다이버전스 "세기"의 상관이 +0.31~+0.41로 실측돼, 다이버전스가 아니라 **되돌림 진행도**를 재고 있었음. 기존에 정의만 되고 호출되지 않던 `check_rsi_divergence()`로 교체. **(2차, 사용자 지적)** 그 함수도 임의 상수 투성이라 재설계 요구 — 실측 결과 **파동 길이 중앙값이 BTC 14봉/ETH 26봉/SOL 18봉**에 불과해 파동 내부에 분리된 두 스윙 고점이 대부분 존재하지 않음이 드러남(고전적 2-피크 다이버전스가 이 스코프에서 구조적으로 불가). 또한 `min_candle_dist=5`가 **BTC 파동의 21.1%를 계산 전에 탈락**시키고 ETH에선 8.5%만 탈락시켜 심볼 간 비대칭까지 만들고 있었고, `nlargest(10)`은 BTC 파동의 54.6%에서 아무 일도 안 하는 사실상 장식이었음. → 피크 탐색을 폐기하고 **argmax/argmin 기반 "모멘텀 천장" 방식**(`calc_rsi_divergence`)으로 재정의, 상수 4종(top-10 / 최소간격 5 / RSI 70·30 / prev1·prev2 OR) 전부 제거. 관측 3칸을 `div_rsi_gap`(모멘텀) + `dist_from_div_peak_to_end`(타이밍) + `div_price_gap`(가격)의 **직교 3축**으로 교체 — 구 `rsi_previous`는 `(rsi_now, div_rsi_gap)`에서 복원 가능한 순수 중복이라 제외. 0/1 플래그 소멸로 센티넬(`rsi_previous=50.0`)과 불연속도 함께 제거. `NORM["div_rsi_gap_max"]=45.0` 신설(120d p99 실측 BTC 35.9/ETH 43.9/SOL 41.4, 전체 기간 p99 33.7/39.7/34.7 — 양쪽 다 커버, 07-25 B그룹 교훈에 따라 느슨한 쪽). **검증**: 3심볼 51.5만 행을 argmax·메모이제이션을 쓰지 않는 무차별 대입으로 독립 재계산해 대조 → 불일치 0건, 인과성 위반 0건(RSI를 읽은 최대 상대인덱스 = −1로 forming 봉 미참조). 의미론 검증에서 **구 로직의 실패 원인이던 되돌림 혼동이 해소됨을 확인** — `corr(fib_pos, 다이버전스 세기)`가 구 +0.31~+0.41 → 신 **+0.11/−0.00/+0.03**, 또한 `gap==0`(확인) 그룹과 `gap>0` 그룹의 fib_pos 중앙값이 0.208 vs 0.206으로 동일해 되돌림의 대리변수가 아님이 확인됨. 🐛 부수 수정 — 캐시 버전이 `prep_features.CACHE_VER`와 `eval.cache_path_for()` **양쪽에 하드코딩된 이중 관리** 상태였음을 스모크 테스트 크래시로 발견, 양쪽 v9c로 맞추고 경고 주석 추가. 단위 테스트(상승/하락 × 다이버전스/확인 + 초단기 파동) 및 3심볼 120d 캐시 빌드 + 학습 파이프라인 스모크(2만 스텝) 통과, 관측 3칸 전부 [0,1]·NaN 없음 확인. **전체 기간 캐시 재생성은 아직 미실행** |
 
 ---
 
@@ -401,14 +408,14 @@ sel_monthly_log = mean(ln m_i) − std(ln m_i)    # BTC 검증 ~12개월
 - **완익 사전결정 구조의 한계** (`V9 Issue - 완익 사전결정 구조.md`, 미구현): 진입 순간에 완익 목표를 박제 → 보유 기간(수 시간~수 일)의 신규 정보를 전부 버림. 테스트 top1_share 55.2%와 무관하지 않을 가능성. rl 모드(2026-07-20)로 1차 대응했으나 불안정(과매매↔무행동 반복, test 성과 붕괴)이 반복돼 2026-07-21 두 번째 후보안으로 **Revise 모드** 설계 착수 (`V9 Design - Revise Mode.md`, 설계 단계·미구현) — adaptive의 연속 행동공간 표현력은 유지하면서 결정을 주기적으로(예: 10분마다) 재수행. 어떤 안이든 행동 공간이 바뀌어 기존 체크포인트와 비호환.
 - **BTC/ETH 성과 괴리** (`V9 Issue - BTC,ETH괴리잡기.md`, 부분 대응): 동적 레버리지 상한으로 근접청산 격차는 구조적으로 해소했으나, ETH 자체의 수익성 문제는 미해결 — 모델 선택을 BTC 단독으로 돌린 것이 그 방증. ETH는 현재 지표 관찰만 유지.
 - ~~**rl 모드 action masking 미도입**~~ → **2026-07-27 적용 완료** (아래 6장 이력 참고). `V9 Design TODO - Action Masking.md`의 설계안대로 구현.
-- **입력벡터 정규화 상한 재검토** (`V9 Design TODO - 입력벡터 구성 파라미터 상한 개선.md`, 분석 완료·미적용): `NORM` 딕셔너리 상수 대부분이 실측 분포 대비 너무 느슨하게(BTC p99 기준 28~46%만 사용) 잡혀있어 관측 해상도가 낭비됨 — `wave_scale_max`/`atr_pct_max`/`duration_log_max`/`div_gap_max`(심볼 편차 있음)와 `ret15/1h_atr_clip`(심볼 편차 적음)이 대상. `liq_dist`(관측 22번칸)는 이미 별도로 수정·적용됨(2026-07-24). `upnl_clip`은 leverage 의존적이라 별도 계측 필요.
+- **입력벡터 정규화 상한 재검토** (`V9 Design TODO - 입력벡터 구성 파라미터 상한 개선.md`, 분석 완료·미적용): `NORM` 딕셔너리 상수 대부분이 실측 분포 대비 너무 느슨하게(BTC p99 기준 28~46%만 사용) 잡혀있어 관측 해상도가 낭비됨 — `wave_scale_max`/`atr_pct_max`/`duration_log_max`/`div_gap_max`(심볼 편차 있음)와 `ret15/1h_atr_clip`(심볼 편차 적음)이 대상. `liq_dist`(관측 22번칸)는 이미 별도로 수정·적용됨(2026-07-24). `upnl_clip`은 leverage 의존적이라 별도 계측 필요. 2026-07-31 v9c 재설계로 다이버전스 3칸의 실측치가 바뀌어 **재계측 필요** — 전체 기간 기준 `div_price_gap` p99가 BTC 1.01/ETH 2.46/SOL 2.61%로 `div_gap_max=5.0` 대비 20~52%만 사용(사용자 지시로 이번엔 상수 미변경), `dist_from_div_peak_to_end`는 `duration_log_max`를 `wave_duration_day`와 공유하는데 정의상 항상 그 이하라 사용률이 더 낮음(관측 실측 최대 0.285). 단 공유 자체는 의도적 — 두 값이 같은 스케일에 놓여야 모델이 "RSI 극점이 파동의 어디쯤이었나"를 직접 비교할 수 있음. 신설된 `div_rsi_gap_max`(45.0)는 3심볼 p99를 커버하도록 이미 실측 기반으로 확정.
 - **`sel_monthly_log` 학습중 기록값 vs `eval.py` 재로드 재평가값 불일치 (원인 미확정, 재현 안 됨)**: `leverage=5` 런(0726-1719)에서 1~2회 관측(80M/94.5M 지점, 부호까지 반대). 동일 조건의 `leverage=10` 런(0727-0934)에서 4개 지점 교차검증 시엔 재현 안 됨(6장 07-27 항목 참고) — 일회성 이상 현상으로 잠정 결론, 재발 시 조치. 진단용 `DEBUG_DUMP_TRADES` 덤프 코드는 재현 안 됨을 확인한 뒤 제거함(재발 시 다시 추가해 조사).
 
 ---
 
 ## <span style="color: #FFA500;">8. 산출물 명명 규칙</span>
 
-- 피처 캐시: `caches/features_v9b_{SYMBOL}[_recent{N}d].npy` + `dist_report_v9b_{SYMBOL}[...].json` (2026-07-20 v9b — 구 `features_v9_*`는 구 체크포인트용 보존)
+- 피처 캐시: `caches/features_v9c_{SYMBOL}[_recent{N}d].npy` + `dist_report_v9c_{SYMBOL}[...].json` (2026-07-31 v9c — RSI 다이버전스 로직 교체. 구 `features_v9b_*`/`features_v9_*`는 구 체크포인트용 보존)
 - 런 이름: `v9_maskablerl_seed{S}_{MMDD-HHMM}` — **시작 시각(KST, 2026-07-20부터) 포함 유니크 (2026-07-19 도입)**. 이전의 `v9_ppo_seed{S}` 고정 이름은 재시작 시 TB 런 디렉토리·체크포인트가 이전 런 산출물을 덮어쓰는 사고가 있어 폐기. 2026-07-20~07-26엔 태그가 `v9_fullctrl_`였음(당시 알고리즘이 PPO로 동일해 "환경 모드" 구분용 이름) — 2026-07-27 action masking(`MaskablePPO`) 도입으로 정책 클래스 자체가 달라지고 기존 `v9_fullctrl_*` 체크포인트와 완전 비호환이 되면서 `v9_maskablerl_`로 개명 (구 `v9_fullctrl_*`는 과거 기록으로 그대로 보존, 재사용 불가 — 3장 Action Masking 참고). TB 로그 디렉토리는 run_name 그대로 남고 SB3의 자동 run-id 접미사(`_1`)는 커스텀 로거로 억제함(2026-07-20, 이미 타임스탬프로 유니크라 불필요).
 - 모델/로그 저장 경로: `v9_maskablerl/` 단일 폴더(`train.MODE_SUBDIR`, 2026-07-27 `v9_fullctrl/`에서 개명). 과거 레거시 `adaptive`/`rule` 모드가 쓰던 `v9_adaptive_ppo/`는 2026-07-30 코드 제거 이후로도 과거 산출물 보관용으로 디스크에 남아있으나 더 이상 생성되지 않음.
 - 모델: `models/{mode_subdir}/{run_name}/{run_name}_{steps}_steps.zip` (주기 체크포인트), `..._best.zip` + `..._best_info.json` (검증 best), `..._final.zip` (학습 종료 시점) — **런별 하위 폴더로 분리** (2026-07-30, logs와 동일하게 `models/{mode_subdir}/{run_name}/` 구조로 변경. 이전엔 `models/{mode_subdir}/` 밑에 모든 런의 산출물이 파일명 접두사(run_name)만으로 평평하게 뒤섞여 있었음). `eval.py`는 `--model` 전체 경로를 직접 받으므로 하드코딩된 경로 참조 없이 영향 없음

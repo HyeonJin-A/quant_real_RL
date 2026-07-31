@@ -113,55 +113,50 @@ def calc_fibo_levels(p1, p2):
     return levels
 
 
-def check_rsi_divergence(df, pivots, min_candle_dist=5):
+def calc_rsi_divergence(rsis, highs, lows, start_idx, end_idx, is_bullish):
     """
-    과거 후보 구간에서 비교 대상을 찾아 다이버전스 성립 여부를 반환함
-    :param df: 시간 역순으로 정렬된 캔들 데이터
-    :param pivots: 시간 역순으로 정렬된 피봇 목록
-    :param min_candle_dist: 다이버전스가 성립되기 위한 최소 캔들 간격
+    파동(leg) 내부의 "모멘텀 천장 대비 현재 모멘텀의 괴리"를 연속값으로 계산한다. (2026-07-31 재설계)
+
+    고전적인 2-피크 다이버전스(서로 다른 스윙 고점끼리 비교)가 아니다. 파동 길이 중앙값이
+    14봉(BTC)/26봉(ETH)에 불과해 **파동 내부에 되돌림으로 분리된 두 개의 스윙 고점이
+    존재하지 않는 경우가 대부분**이라, 피크 탐색 자체를 포기하고 argmax/argmin으로 재정의했다.
+
+    파동 끝 극점(a_p1)의 가격은 정의상 파동 내 가격 극값이므로 "higher high" 조건은 항상
+    자동 충족된다 → 신호는 순수하게 RSI 비교로 환원된다. 그래서 가격 조건을 따로 보지 않는다.
+
+    구버전(피크 탐색)이 쓰던 임의 상수 — 후보 상위 10개(`nlargest(10)`), 최소 캔들 간격 5,
+    RSI 임계값 70/30, prev1/prev2 OR 판정 — 을 **하나도 쓰지 않는다.** 특히 최소 캔들 간격 5는
+    BTC 파동의 21.1%를 계산도 해보기 전에 탈락시키고 있었고(파동이 5봉 이하면 후보 구간이 공백),
+    같은 상수가 ETH에선 8.5%만 탈락시켜 심볼 간 비대칭까지 만들고 있었다.
+
+    :param rsis: 5m RSI 배열 (시간 오름차순)
+    :param highs: 5m 고가 배열 (시간 오름차순)
+    :param lows: 5m 저가 배열 (시간 오름차순)
+    :param start_idx: 파동 시작 피봇 인덱스 (a_p2)
+    :param end_idx: 파동 끝 기준 인덱스. RSI를 읽을 수 있는 마지막 인덱스여야 하므로
+                    호출부에서 a_p1을 직전 마감봉으로 클램프해서 넘긴다 (인과성)
+    :param is_bullish: 상승 파동(끝점이 고점)이면 True
+    :return: (rsi_gap, dist_bars, ref_price)
+        - rsi_gap: 파동 내 RSI 극값 − 파동 끝 RSI (방향 조정, 항상 >= 0).
+                   0이면 모멘텀이 가격과 동시에 정점 = 확인(confirmation),
+                   클수록 모멘텀이 먼저 꺾인 뒤 가격만 진행 = 다이버전스
+        - dist_bars: RSI 극점에서 파동 끝까지의 5m 봉 개수 (>= 0). 0이면 방금 정점
+        - ref_price: RSI 극점 봉의 가격(상승이면 고가, 하락이면 저가).
+                     가격 갭은 파동 극점 가격이 1m마다 갱신되므로 호출부에서 계산한다
     """
-    pivot_idx = pivots[1]['index']
-    extreme_idx = pivots[0]['index']
-    extreme_type = pivots[0]['type']
-    extreme_candle = df.loc[extreme_idx]
+    if end_idx <= start_idx:
+        return 0.0, 0, 0.0
 
-    # [2-1] 후보 구간 추출
-    between_df = df.loc[extreme_idx + 1 + min_candle_dist: pivot_idx]
-    if between_df.empty:
-        return False, None
+    window = rsis[start_idx:end_idx + 1]
+    j = start_idx + int(np.argmax(window) if is_bullish else np.argmin(window))
 
-    # [2-2] 타입에 따른 설정값 세팅
-    if extreme_type == 'high':
-        prev_idxes = between_df['high'].nlargest(10).index
-        sort_col, agg_func, div_type = 'high', 'idxmax', 'bearish'
-        rsi_threshold = lambda x: x > 70
-        rsi_comp = lambda a, b: a > b  # RSI가 낮아져야 함 (Bearish)
-    else:
-        prev_idxes = between_df['low'].nsmallest(10).index
-        sort_col, agg_func, div_type = 'low', 'idxmin', 'bullish'
-        rsi_threshold = lambda x: x < 30
-        rsi_comp = lambda a, b: a < b  # RSI가 높아져야 함 (Bullish)
+    rsi_ref = float(rsis[j])
+    rsi_end = float(rsis[end_idx])
+    # rsi_ref는 end_idx를 포함한 구간의 극값이므로 방향 조정 후 항상 >= 0 (max는 부동소수 방어)
+    rsi_gap = max(0.0, (rsi_ref - rsi_end) if is_bullish else (rsi_end - rsi_ref))
+    ref_price = float(highs[j] if is_bullish else lows[j])
 
-    candidates = df.loc[prev_idxes].sort_values(by='ts', ascending=False)
-
-    # [2-3] 비교 대상(prev_extreme_candles) 선별
-    prev1_idx = getattr(candidates[sort_col], agg_func)()
-    prev_extreme_candles = [candidates.loc[prev1_idx]]
-
-    prev2_candidates = candidates[candidates.index >= prev1_idx + min_candle_dist]
-    if not prev2_candidates.empty:
-        prev2_idx = getattr(prev2_candidates[sort_col], agg_func)()
-        prev_extreme_candles.append(prev2_candidates.loc[prev2_idx])
-
-    # [3] 최종 다이버전스 체크
-    for prev_candle in prev_extreme_candles:
-        if rsi_threshold(prev_candle['rsi']) and rsi_comp(prev_candle['rsi'], extreme_candle['rsi']):
-            return True, {
-                'type': div_type,
-                'candle1': prev_candle,
-                'candle2': extreme_candle,
-            }
-    return False, None
+    return rsi_gap, end_idx - j, ref_price
 
 
 def get_relative_volume_strength(df, target_idx, period=500):
