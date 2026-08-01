@@ -51,7 +51,10 @@ PRE_HIT_LEVEL = 0.382
 VOL_STRENGTH_PERIOD = 500
 WARMUP_5M = 200
 
-CACHE_VER = "v9c"  # 2026-07-31: RSI 다이버전스 3컬럼을 임의 상수 없는 "모멘텀 천장" 방식으로 재설계
+CACHE_VER = "v10"  # 2026-08-01: 🚨 피봇 룩어헤드 수정 — admission 가드가 min_diff 조건을
+                   # 빼먹고 n봉 경과만 보던 버그. 검출도 역순→정순 인과 스캔으로 교체.
+                   # 이전 모든 캐시(v9/v9b/v9c)와 그로 학습된 결과는 전부 무효.
+                   # 2026-07-31 (v9c): RSI 다이버전스 3컬럼을 임의 상수 없는 "모멘텀 천장" 방식으로 재설계
                    # (has_rsi_divergence/rsi_previous/divergence_price_gap_percent →
                    #  div_rsi_gap/dist_from_div_peak_to_end/div_price_gap). 구 v9b와 비호환
 
@@ -198,15 +201,12 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
     # trades_per_month(1000배), yearly_breakdown(1970년) 등이 연쇄로 깨졌었음.
     ts_1m_ms = (df_1m["ts_dt"].astype("datetime64[ns]").astype("int64") // 10**6).values
 
-    # --- 전역 피봇 (V8과 동일: 내림차순 df에서 감지 후 오름차순 인덱스로 변환) ---
+    # --- 전역 피봇 (2026-08-01: 시간 오름차순 인과 검출로 교체) ---
+    # 구버전은 내림차순 df에 검출기를 돌린 뒤 인덱스를 되돌렸다 — 스캔이 최신 봉에서
+    # 과거로 진행되는 구조라 라이브 재현이 불가능했다. 이제 정순 1회 순회로 검출하고
+    # 각 피봇의 confirm_index(확정 봉)를 함께 받는다.
     print("Calculating global pivots on 5m...")
-    df_5m_desc = df_5m.iloc[::-1].reset_index(drop=True)
-    global_pivots_desc = find_dynamic_pivots(df_5m_desc, n=n, min_diff=min_diff)
-    global_pivots = sorted(
-        ({"index": total_5m - 1 - p["index"], "type": p["type"], "price": p["price"]}
-         for p in global_pivots_desc),
-        key=lambda x: x["index"],
-    )
+    global_pivots = find_dynamic_pivots(df_5m, n=n, min_diff=min_diff)
     print(f"pivots: {len(global_pivots)}  ({time.time() - t0:.1f}s)")
 
     # --- 1m 순회: 파동 매핑 + 피처 추출 ---
@@ -255,7 +255,12 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
         if lows_1m[i] < forming_low:
             forming_low = lows_1m[i]
 
-        while pivot_ptr < len(global_pivots) and global_pivots[pivot_ptr]["index"] <= idx_5m - n:
+        # 🚨 admission 가드 (2026-08-01 수정). 구버전은 `index <= idx_5m - n`으로
+        # **거리 조건(n)만** 보고 **가격 조건(min_diff)을 빼먹어**, 반등이 min_diff에
+        # 도달하기도 전에 피봇을 확정 처리했다 — 반등이 늦게 오는 파동일수록 미래를 크게
+        # 앞당겨 썼다(실측 최대 47봉=3.9시간). 이제 검출기가 두 조건을 모두 만족한 봉을
+        # confirm_index로 알려주므로, 그 봉이 마감된 뒤에만 쓴다.
+        while pivot_ptr < len(global_pivots) and global_pivots[pivot_ptr]["confirm_index"] < idx_5m:
             pivot_ptr += 1
         if pivot_ptr < 2:
             continue

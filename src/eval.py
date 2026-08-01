@@ -44,10 +44,10 @@ NEAR_LIQUIDATION_THRESHOLD = -95.0  # 증거금(100) 거의 다 날린 거래 �
 
 
 def cache_path_for(symbol, suffix=""):
-    # 2026-07-31: v9c — RSI 다이버전스 3컬럼 재설계판. 구 v9b/v9 캐시는 구 체크포인트 평가용으로 보존
-    # (단, 구 체크포인트 평가는 당시 코드(git) 기준으로만 유효 — 관측 피처 정의가 다름)
+    # 2026-08-01: v10 — 🚨 피봇 admission 룩어헤드 수정판. 구 v9c/v9b/v9 캐시와 그로 학습된
+    # 모든 체크포인트는 미래 정보가 섞여 있어 성능이 과대평가돼 있다(재사용 금지, 보관만).
     # 🚨 prep_features.CACHE_VER와 반드시 같은 값을 유지할 것 (캐시 버전을 올릴 때 양쪽 모두 수정)
-    return os.path.join(CACHE_DIR, f"features_v9c_{symbol}{suffix}.npy")
+    return os.path.join(CACHE_DIR, f"features_v10_{symbol}{suffix}.npy")
 
 
 def split_bounds(cache_paths, final=False):
