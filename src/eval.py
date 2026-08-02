@@ -49,7 +49,8 @@ def cache_path_for(symbol, suffix=""):
     # v9b 체크포인트는 관측 차원 불일치로 로드 불가 — 구 체크포인트 평가는 구 커밋 체크아웃으로.
     # (v9c/v9d/v10은 rsi-div-overhaul 브랜치 실험이 선점한 버전명이라 v9e로 명명)
     # (단, 구 체크포인트 평가는 당시 코드(git) 기준으로만 유효 — 관측 차원이 다름)
-    return os.path.join(CACHE_DIR, f"features_v9e_{symbol}{suffix}.npy")
+    # 2026-08-02: v9f — rsi_momentum_gap(밀집 모멘텀 천장 갭) 추가, 관측 19→20
+    return os.path.join(CACHE_DIR, f"features_v9f_{symbol}{suffix}.npy")
 
 
 def split_bounds(cache_paths, final=False):

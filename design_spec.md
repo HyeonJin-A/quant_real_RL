@@ -58,7 +58,8 @@ quant_real_RL/
   | XRP-USDT-SWAP | 4 | 0.04 | (2026-07-23, 파라미터만 등록 — 원본 데이터 미보유로 캐시는 아직 미생성) |
   | (그 외 폴백) | 8 | 0.02 |
 
-### <span style="color: #2E8B57;">피처 캐시 (`features_v9e_{SYMBOL}.npy`, 행당 26컬럼 — 2026-08-02 v9e)</span>
+### <span style="color: #2E8B57;">피처 캐시 (`features_v9f_{SYMBOL}.npy`, 행당 27컬럼 — 2026-08-02 v9f)</span>
+- **v9f (2026-08-02)**: `rsi_momentum_gap`(모멘텀 천장 갭) 컬럼 추가 — last wave(a_p2→a_p1) 구간에서 RSI가 가장 강했던 값과 파동 끝 봉 RSI의 방향보정 차이(항상 ≥0, 끝 봉이 forming이면 마감봉으로 클램프). v9e 학습 결과(BTC 거래 93% 증발, 전 지표 후퇴)의 진단 — "구 버그 플래그가 사실상 되돌림+모멘텀 감쇠 밀집 복합 신호였다" — 에 따라, 정직한 정의의 밀집 신호로 보완(120d 실측: 행의 55~68%에서 활성, p99 22.5~24.8pt). 피봇/다이버전스 로직은 v9e에서 불변(단일 변수 실험).
 - **v9e (2026-08-02)**: RSI 다이버전스 재작성 (`RSI-div-개편이전-핵심결함.md`) — ① 합성(forming) 극점 피봇의 `index`를 현재 봉이 아닌 **실제 극점 봉**(argmax/argmin 추적)으로 기록해, 다이버전스의 (가격, RSI) 쌍을 같은 봉에서 읽음(구버전은 가격=수시간 전 극점, RSI=직전 마감봉이라 "되돌림이 깊을수록 자동 성립"하는 구조적 오류). ② `rsi_divergence_gap`(방향보정 rsi1−rsi2, 성립 시 항상 양수) 컬럼 신설. ③ 구조적 필터 복원: 두 극점 간 최소 5봉(`DIV_MIN_CANDLE_DIST`), 최소 RSI 갭 1pt(`DIV_MIN_RSI_GAP`). RSI 70/30 임계는 하드 필터 대신 관측의 rsi_adj 피처로 학습에 위임. ④ 극점이 forming 봉이면 RSI 미확정이므로 다이버전스 판정하지 않음(마감 후 확정). 부수 효과로 `wave_duration_day`(파동 길이가 실제 극점 봉까지로 정확해짐)와 `relative_volume_strength`(실제 극점 봉 볼륨 사용) 분포도 교정됨. div=1 비율 19~23% → 8~12%(120d 실측). 검증 게이트: `src/verify_div_cache.py`.
 - **v9b (2026-07-20)**: 타이밍 피처 4컬럼 추가 — `rsi_now`(직전 마감 5m RSI), `ret_5m/ret_15m/ret_1h`(1m 종가 트레일링 수익률). 구 v9 캐시(21컬럼)와 비호환이라 파일명 분리, 구 캐시는 구 체크포인트 참조용으로 보존.
 - 5m 파동을 1m 스냅샷에 매핑. **매 1m 행은 그 시점에 실시간으로 알 수 있었던 정보만 포함** (인과성 보장): forming 캔들 극값 추적, 피봇 확정 지연(`index ≤ idx_5m − n`), 지표는 직전 마감 5m 캔들 기준.
@@ -81,7 +82,7 @@ quant_real_RL/
 
 과거 `adaptive`(Box(-1,1)^6 연속, 진입 시 레버리지/손절/반익/완익까지 정책이 전부 결정하는 semi-MDP)와 `rule`(Discrete(2) Skip/Enter, 청산은 V8 엔진 고정 — Fallback B) 모드는 2026-07-30 `env.py`/`train.py`/`eval.py`에서 코드째 완전히 제거됨(`simulate_adaptive_exit`/`simulate_v8_exit`/`dynamic_leverage_ceiling` 등 전용 함수, `exit_mode` 인자 자체 포함). 아래 소절들은 현재 유효한 rl 모드 사양만 기술한다.
 
-### <span style="color: #2E8B57;">관측 공간 (19차원, `_build_static_obs`에서 전 행 사전 정규화)</span>
+### <span style="color: #2E8B57;">관측 공간 (20차원, `_build_static_obs`에서 전 행 사전 정규화)</span>
 | # | 피처 | 정규화 |
 |---|---|---|
 | 1 | wave_scale_percent | clip 0~12% → /12 |
@@ -90,6 +91,7 @@ quant_real_RL/
 | 4 | 방향조정 RSI (`rsi if bullish else 100−rsi`) | /100 |
 | 5 | divergence_price_gap_percent | clip 0~5% → /5 |
 | 6 | rsi_divergence_gap (방향보정 rsi1−rsi2) — **2026-08-02 추가 (v9e)** | clip 0~20pt → /20 |
+| 7 | rsi_momentum_gap (모멘텀 천장 갭, 밀집) — **2026-08-02 추가 (v9f)** | clip 0~30pt → /30 |
 | 7 | volatility_ratio | log1p, clip 0~6 |
 | 8 | relative_volume_strength | clip 0~1 |
 | 9 | adx_5m | /100 |
@@ -104,17 +106,17 @@ quant_real_RL/
 - 포지션 상태 4칸은 2026-07-19 제거 — semi-MDP는 결정 시점에 항상 무포지션이라 영원히 0인 죽은 차원이었음 ("rl" 모드는 아래 4칸을 추가한 23차원 사용).
 - wave_age_min은 wave_duration_day와 상관 0.87로 중복이라 관측에서 제외 (델타 피처의 내부 판정에만 사용).
 
-### <span style="color: #2E8B57;">rl 모드 전용 관측 4칸 (RL_OBS_DIM=23, 위 19칸 + 아래)</span>
+### <span style="color: #2E8B57;">rl 모드 전용 관측 4칸 (RL_OBS_DIM=24, 위 20칸 + 아래)</span>
 | # | 피처 | 정규화 | 필요성 |
 |---|---|---|---|
-| 20 | pos_dir | −1/0/+1 | 같은 행동 라벨(Hold/Enter/Close)의 실제 효과가 상태에 따라 달라져(예: 보유 중 Enter=no-op) 이 신호 없이는 판독 불가 |
-| 21 | 미실현손익/증거금 | clip(−1.5,3.0) → **[−1,1] 재스케일 (2026-07-20)** | 익절/손절 판단의 직접 근거. 이전엔 원시 클립값을 그대로 써서 다른 피처와 스케일 불일치했음 |
-| 22 | 보유시간 | log1p, /hold_log_max(30일) | rl 모드엔 강제 타임아웃이 없음 — "너무 오래 끌면 접기"를 배우는 유일한 단서 |
-| 23 | 청산가까지 거리 | `log1p(liq_dist) / log1p(100/leverage)` (2026-07-24, 하드클립 폐기) | 동적 레버리지 상한 같은 별도 안전장치가 없어, 파산 방지가 사실상 이 관측 하나에 의존 — 아래 안전 프로파일 참고. 구 `clip(0,10%)/10`은 진입 시점 값(≈100/leverage%)부터 이미 옛 상한을 넘어(leverage≤10이면 상시), 보유기간 대부분 obs=1.0으로 뭉개져 청산 근접 정보가 사실상 안 전달되고 있었음 — log 압축으로 교체해 위험(0 근접) 구간엔 해상도를 몰아주고 안전 구간은 압축하되 정보를 완전히 버리지 않음. 기준값(`100/leverage`)은 진입 시점 값이라 obs=1.0이 "진입 때만큼 안전"을 의미 |
+| 21 | pos_dir | −1/0/+1 | 같은 행동 라벨(Hold/Enter/Close)의 실제 효과가 상태에 따라 달라져(예: 보유 중 Enter=no-op) 이 신호 없이는 판독 불가 |
+| 22 | 미실현손익/증거금 | clip(−1.5,3.0) → **[−1,1] 재스케일 (2026-07-20)** | 익절/손절 판단의 직접 근거. 이전엔 원시 클립값을 그대로 써서 다른 피처와 스케일 불일치했음 |
+| 23 | 보유시간 | log1p, /hold_log_max(30일) | rl 모드엔 강제 타임아웃이 없음 — "너무 오래 끌면 접기"를 배우는 유일한 단서 |
+| 24 | 청산가까지 거리 | `log1p(liq_dist) / log1p(100/leverage)` (2026-07-24, 하드클립 폐기) | 동적 레버리지 상한 같은 별도 안전장치가 없어, 파산 방지가 사실상 이 관측 하나에 의존 — 아래 안전 프로파일 참고. 구 `clip(0,10%)/10`은 진입 시점 값(≈100/leverage%)부터 이미 옛 상한을 넘어(leverage≤10이면 상시), 보유기간 대부분 obs=1.0으로 뭉개져 청산 근접 정보가 사실상 안 전달되고 있었음 — log 압축으로 교체해 위험(0 근접) 구간엔 해상도를 몰아주고 안전 구간은 압축하되 정보를 완전히 버리지 않음. 기준값(`100/leverage`)은 진입 시점 값이라 obs=1.0이 "진입 때만큼 안전"을 의미 |
 
-무포지션이면(20~23) 전부 0. (관측 번호는 2026-08-02 v9e에서 rsi_divergence_gap 삽입으로 1칸씩 밀림 — 과거 이력 기술의 "20/22번칸"은 각각 현재 21/23번칸)
+무포지션이면(21~24) 전부 0. (관측 번호는 2026-08-02 v9e/v9f에서 rsi_divergence_gap·rsi_momentum_gap 삽입으로 2칸씩 밀림 — 과거 이력 기술의 "20/22번칸"은 각각 현재 22/24번칸)
 
-> 과거 `adaptive` 모드의 Box(-1,1)^6 행동 공간(레버리지/손절/반익/완익 직접 결정, `simulate_adaptive_exit`)과 `dynamic_leverage_ceiling`(손절 거리 기반 동적 레버리지 상한, 거래당 손실 20% 캡)은 **2026-07-30 코드에서 완전히 제거**됨. rl 모드에는 이런 안전장치가 없으며, 파산 방지는 전적으로 정책이 학습한 청산가 거리 판단(위 23번 관측칸)에 의존한다.
+> 과거 `adaptive` 모드의 Box(-1,1)^6 행동 공간(레버리지/손절/반익/완익 직접 결정, `simulate_adaptive_exit`)과 `dynamic_leverage_ceiling`(손절 거리 기반 동적 레버리지 상한, 거래당 손실 20% 캡)은 **2026-07-30 코드에서 완전히 제거**됨. rl 모드에는 이런 안전장치가 없으며, 파산 방지는 전적으로 정책이 학습한 청산가 거리 판단(위 24번 관측칸)에 의존한다.
 
 ### <span style="color: #2E8B57;">시장 메커니즘 (env에는 "시장의 물리 법칙"만)</span>
 - 증거금 **100 USDT 고정** × 정책 선택 레버리지. 사이즈가 아닌 레버리지를 다이얼로 쓰는 이유: 둘 다 달러 손익 스케일엔 동일하게 작용하지만 **청산까지의 거리는 레버리지만이 결정**하기 때문.
@@ -141,7 +143,7 @@ quant_real_RL/
 ### <span style="color: #2E8B57;">신경망 및 PPO 하이퍼파라미터 (stable-baselines3)</span>
 | 항목 | 값 | 비고 |
 |---|---|---|
-| 정책망 | MlpPolicy `net_arch=[64, 64]` | 23차원 관측(2026-08-02 v9e, 구 22) + Discrete(3) 액션 (MaskablePPO — "18차원 관측 + 6차원 연속 액션"은 구 adaptive 모드 기술이었음) |
+| 정책망 | MlpPolicy `net_arch=[64, 64]` | 24차원 관측(2026-08-02 v9f, 구 22) + Discrete(3) 액션 (MaskablePPO — "18차원 관측 + 6차원 연속 액션"은 구 adaptive 모드 기술이었음) |
 | learning_rate | 3e-4 → 0 선형 감쇠 | |
 | n_steps / batch_size / n_epochs | 2048/워커, 512, 10 | |
 | gamma / gae_lambda | 0.999 / 0.95 | 1m 스텝 기준 유효 horizon ~16시간 |
@@ -396,6 +398,8 @@ sel_monthly_log = mean(ln m_i) − std(ln m_i)    # BTC 검증 ~12개월
 | 07-29 | **best 선택 기준 v9_kpi 가중 4:3:3→6:2:2(수익성 60%) + 이동평균 스무딩(`--kpi-smooth-window` 기본 3) 추가** | 사용자 지시. 계기: 수수료 실험과 별개로 진행한 0729-1938 런(변경된 설정 미상 — 로그에 argv가 안 남아 원인 특정 불가) 검토 중, best로 뽑힌 73M 지점이 단발성 스파이크(v9_kpi=1.367, 전후 체크포인트는 0.7~0.9대)였고, 95.5~96.0M 구간(연속 2회 1.1대 유지, sel_monthly_log·MDD 둘 다 73M보다 우수)이 근소한 차이로 밀린 것을 확인 — 고립된 스파이크가 꾸준히 좋았던 구간을 이기는 선택 방식의 문제로 진단. `ValidationCallback`이 원시 v9_kpi 대신 최근 N회 이동평균을 `best_score`와 비교하도록 변경(자격 게이트는 현재 시점 기준 유지). 가중치는 수익성 비중을 40%→60%로 상향(mdd:msl 상대비율 1:1 유지). 스모크 테스트(2만 스텝, window=2) 통과 — `v9_kpi`/`v9_kpi_smoothed` 정상 기록 확인. ⚠️ 소급 재검증(과거 런 best 재선택 결과)은 미실시 — 다음 재학습부터 적용 |
 | 07-30 | **레거시 `adaptive`/`rule` 모드 구현 코드 완전 제거** | 사용자 지시 — rl 모드가 유일한 실사용 모드로 확정된 지 오래라 죽은 코드를 정리. `env.py`: `simulate_adaptive_exit`/`simulate_v8_exit`/`dynamic_leverage_ceiling` 함수, `ADAPTIVE_ACTION_DIM`/`LEVERAGE_RANGE`/`SL_MULTIPLIER_RANGE`/`TP_HALF_RANGE`/`TP_FULL_EXTRA_RANGE`/`MAX_TRADE_LOSS_PCT` 등 전용 상수, `_step_rule`/`_step_adaptive` 메서드, 생성자의 `exit_mode`/`sl_multiplier`/`tp_half_level`/`be_trigger_level`/`leverage_max` 인자를 전부 삭제 — `action_space`/`observation_space`/`step()`이 이제 rl 모드 하나로 무조건 고정. `train.py`: `LogStdClampCallback`/`LeverageMaxSchedule` 콜백과 그 전용 CLI 인자(`--log-std-min/-max`, `--leverage-max-start/-full`, `--leverage-curriculum-frac`), `--exit-mode`/`--sl-multiplier`/`--tp-half-level`/`--be-trigger-level` 삭제, `mode_subdir()`→`MODE_SUBDIR` 상수로 단순화, `PPOClass` 분기 제거하고 `MaskablePPO` 고정. `eval.py`: `exit_mode`/`sl_multiplier`/`tp_half_level`/`be_trigger_level`/`leverage_max` 관련 파라미터 전부 삭제. `EntCoefSchedule`/`ExploreBonusSchedule`/`ValidationCallback`(v9_kpi 계산·TB 로깅·자격 게이트 3종 포함)은 rl 모드에서도 그대로 쓰이므로 **한 글자도 안 건드림**. 스모크 테스트(2만 스텝, `--dummy-vec --cache-suffix _recent120d`)로 학습·검증·체크포인트 저장·`eval.py` 재로드 전 경로 정상 동작 확인 — TB에 `v9_kpi`/`v9_kpi_z_*`/`compound_mdd_pct` 등 기존 지표 전부 정상 기록됨을 재확인. 배경에서 돌던 기존 학습 프로세스(`v9_maskablerl_seed0_0730-0342`, 03:41 시작)는 이미 메모리에 구버전 코드가 로드돼 있어 이번 변경의 영향을 받지 않음(재시작 시에만 새 코드 적용). ⚠️ 1차 시도에서 `env.py`의 관측 공간을 22→26차원으로 바꾸는 등 스코프를 벗어난 재작성이 섞여 들어갔던 것을 사용자가 발견해 롤백 후 재작업 — 이번엔 삭제만 하고 rl 모드 로직은 전혀 손대지 않았음을 매 파일 diff로 확인 |
 | 08-02 | **RSI 다이버전스 피처 전면 재작성 (캐시 v9e, 관측 18→19/22→23차원)** | `RSI-div-개편이전-핵심결함.md` 진단의 구현. 핵심 결함: `prep_features.py`의 합성(forming) 극점 피봇 `index`가 항상 현재 봉(idx_5m)이라, 다이버전스의 rsi2가 "극점 봉 RSI"가 아닌 "직전 마감봉 RSI"로 읽혀 가격(수시간 전 극점)과 RSI(지금)의 짝이 깨짐 — 되돌림이 깊을수록 자동 성립하는 되돌림 진행도 측정기였음(fib_pos↔갭 corr +0.34~0.41, div=1 비율 19~23%). **수정**: ① 마감 구간 극값 메모를 argmax/argmin으로 확장해 극점 봉 인덱스 추적, 합성 피봇 index에 기록(부수 교정: wave_duration_day가 실제 극점까지로 단축 — 120d 실측 행 58~60% 변화, relative_volume_strength도 실제 극점 봉 볼륨으로 — 48~54% 변화) ② 극점이 forming 봉이면 RSI 미확정이라 판정 스킵(구 클램프 폐지) ③ `rsi_divergence_gap`(방향보정 rsi1−rsi2) 컬럼+관측 추가(NORM 20pt, 120d p99 14~18pt) ④ 필터 복원: 극점 간 최소 5봉+최소 갭 1pt, RSI 70/30은 피처로 위임 ⑤ 항상 참이던 `a_p3.type==a_p1.type` no-op 가드 삭제, CSV rsi 컬럼 부재 시 무음 50.0 폴백 → 명시적 에러 ⑥ `algorithm.py` 죽은 코드 6개 함수 삭제(`find_dynamic_pivots`만 유지, 사용자가 외부 참조 없음 확인). **검증**(`src/verify_div_cache.py` 신설, 120d 스모크): 개편 전 캐시 FAIL 재현(에피소드 내 갭 표류율 38.7~47.1%) → v9e 3심볼 전체 PASS(0~0.6%, 부호모순 0건), div=1 비율 8~12%로 정화, 필드 단위 회귀 검사로 변경 의도 없는 20개 컬럼 비트 동일 확인, env 23차원 스모크 통과. 잔존 corr +0.26~0.32(에피소드 단위)는 "갭 큰 다이버전스일수록 이후 되돌림이 깊다"는 시장 신호로 판정(누출 아님 — 갭이 극점 쌍에 고정돼 파동 내 기계적 경로 소멸). **비호환**: v9b 체크포인트 로드 불가(관측 차원), 전 심볼 캐시 재생성 + 신규 학습 필요 |
+| 08-02 | **rsi_momentum_gap(모멘텀 천장 갭) 추가 (캐시 v9f, 관측 19→20/23→24차원)** | v9e 첫 학습 런(0802-1219, BTC+ETH, 100M) 평가 결과 베이스라인(0728-1924) 대비 전면 후퇴 — BTC valid kpi 1.667→1.138, total_pnl +1416.6→+39.6, 거래 1727→119건(93% 증발), test는 소폭 적자 전환, KPI 궤적이 100M 내내 0.8~1.1 박스권(상승 추세 없음). 평가 시 --leverage 3 필수 주의(누락 시 env 기본 20배로 전 심볼 가짜 파산 — 실제로 1차 평가에서 발생, 재평가로 정정. 학습중 검증 기록과 재로드 값은 정확히 일치 확인). 진단: 구 버그 다이버전스 플래그는 룩어헤드가 아니라 '되돌림 깊음+모멘텀 식음'의 밀집 복합 신호였고 fade 전략의 주력 진입 신호 역할을 해왔음 — v9e가 이를 7~10%짜리 희소 이벤트로 대체하자 정책이 진입 확신을 잃은 것으로 해석. 대응: 보류된 v10 실험의 아이디어(파동 내 RSI 극값 vs 파동 끝 봉 RSI의 방향보정 차이)를 **피봇 로직 변경 없이** 밀집 피처 하나로만 이식(단일 변수 실험). 120d 실측 행 55~68% 활성, p99 22.5~24.8pt → NORM 30. 필드 회귀 검사: v9e 대비 기존 26컬럼 전부 비트 동일, 신규 갭 음수 0건, env 24차원 스모크 통과. duration NORM 재조정은 실험 변수 격리를 위해 의도적으로 보류(사용자 지시) |
+| 08-02 | **실험 exp_v9bx: "v9b + 버그 2개만 수정" 기준선 재측정** | v9e/v9f가 v9b 대비 다변수 변경이라 원인 귀속이 불가하다는 문제 제기(사용자)에 따라, 세션 시작 시점(0e6a5be) 소스 5개(prep/algorithm/env/eval/train)를 `exp_v9bx/`로 추출해 두 가지 버그만 수정: ① 다이버전스 (가격,RSI) 짝 버그(극점 봉 인덱스 추적, forming 스킵 — 필터/신규 컬럼은 미도입) ② 피봇 admission 룩어헤드(v10 브랜치 5a360bd의 confirm_index 정순 인과 검출기 이식). 스키마 25컬럼·관측 18+4=22차원은 v9b와 동일 → v9b 베이스라인과 순수 비교용. 캐시 `features_v9bx_*`, 산출물은 models|logs/v9bx/로 분리(run_name 접두사 v9bx_). 120d 스모크: div=1 19%→10~11%(가짜 정리, 필터 없어 v9e보다 소폭 높음 — 의도), 피봇 수 증가(N-bar 미래조건 제거 영향), env 22차원 로드 정상. 목적: v9b KPI 1.667이라는 기준선 자체가 룩어헤드로 부풀려진 허수인지 판정 — 이 실험 결과가 이후 모든 목표치의 눈금이 됨 |
 
 ---
 
@@ -411,7 +415,7 @@ sel_monthly_log = mean(ln m_i) − std(ln m_i)    # BTC 검증 ~12개월
 
 ## <span style="color: #FFA500;">8. 산출물 명명 규칙</span>
 
-- 피처 캐시: `caches/features_v9e_{SYMBOL}[_recent{N}d].npy` + `dist_report_v9e_{SYMBOL}[...].json` (2026-08-02 v9e — 구 `features_v9b_*`/`features_v9_*`는 구 체크포인트용 보존)
+- 피처 캐시: `caches/features_v9f_{SYMBOL}[_recent{N}d].npy` + `dist_report_v9f_{SYMBOL}[...].json` (2026-08-02 v9f — 구 `features_v9e_*`/`features_v9b_*`/`features_v9_*`는 구 체크포인트용 보존)
 - 런 이름: `v9_maskablerl_seed{S}_{MMDD-HHMM}` — **시작 시각(KST, 2026-07-20부터) 포함 유니크 (2026-07-19 도입)**. 이전의 `v9_ppo_seed{S}` 고정 이름은 재시작 시 TB 런 디렉토리·체크포인트가 이전 런 산출물을 덮어쓰는 사고가 있어 폐기. 2026-07-20~07-26엔 태그가 `v9_fullctrl_`였음(당시 알고리즘이 PPO로 동일해 "환경 모드" 구분용 이름) — 2026-07-27 action masking(`MaskablePPO`) 도입으로 정책 클래스 자체가 달라지고 기존 `v9_fullctrl_*` 체크포인트와 완전 비호환이 되면서 `v9_maskablerl_`로 개명 (구 `v9_fullctrl_*`는 과거 기록으로 그대로 보존, 재사용 불가 — 3장 Action Masking 참고). TB 로그 디렉토리는 run_name 그대로 남고 SB3의 자동 run-id 접미사(`_1`)는 커스텀 로거로 억제함(2026-07-20, 이미 타임스탬프로 유니크라 불필요).
 - 모델/로그 저장 경로: `v9_maskablerl/` 단일 폴더(`train.MODE_SUBDIR`, 2026-07-27 `v9_fullctrl/`에서 개명). 과거 레거시 `adaptive`/`rule` 모드가 쓰던 `v9_adaptive_ppo/`는 2026-07-30 코드 제거 이후로도 과거 산출물 보관용으로 디스크에 남아있으나 더 이상 생성되지 않음.
 - 모델: `models/{mode_subdir}/{run_name}/{run_name}_{steps}_steps.zip` (주기 체크포인트), `..._best.zip` + `..._best_info.json` (검증 best), `..._final.zip` (학습 종료 시점) — **런별 하위 폴더로 분리** (2026-07-30, logs와 동일하게 `models/{mode_subdir}/{run_name}/` 구조로 변경. 이전엔 `models/{mode_subdir}/` 밑에 모든 런의 산출물이 파일명 접두사(run_name)만으로 평평하게 뒤섞여 있었음). `eval.py`는 `--model` 전체 경로를 직접 받으므로 하드코딩된 경로 참조 없이 영향 없음

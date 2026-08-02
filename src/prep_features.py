@@ -60,9 +60,13 @@ WARMUP_5M = 200
 DIV_MIN_CANDLE_DIST = 5   # 두 극점 간 최소 5m봉 간격 (구버전 check_rsi_divergence의 min_candle_dist)
 DIV_MIN_RSI_GAP = 1.0     # 방향보정 RSI 갭 최소값 (pt) — 부동소수 수준 노이즈 컷
 
-CACHE_VER = "v9e"  # 2026-08-02: 다이버전스 (가격,RSI) 짝 복원 + rsi_divergence_gap 컬럼 추가
-                   # (RSI-div-개편이전-핵심결함.md) — 관측 차원 변경(18→19)으로 구 캐시/체크포인트와 비호환.
-                   # 버전명이 v9e인 이유: v9c/v9d/v10은 rsi-div-overhaul 브랜치 실험(보류됨)이 선점 —
+CACHE_VER = "v9f"  # 2026-08-02: rsi_momentum_gap(모멘텀 천장 갭, 밀집 피처) 추가 — v9e 학습 결과
+                   # BTC 거래 93% 증발·전 지표 후퇴. 구 버그 플래그가 사실상 "되돌림 깊음+모멘텀 식음"
+                   # 밀집 복합 신호였다는 진단에 따라, 정직한 정의의 밀집 신호로 대체 투입 (v10 아이디어,
+                   # 단 피봇 로직은 불변이라 단일 변수 실험).
+                   # v9e (2026-08-02): 다이버전스 (가격,RSI) 짝 복원 + rsi_divergence_gap 컬럼 추가
+                   # (RSI-div-개편이전-핵심결함.md) — 관측 차원 변경으로 구 캐시/체크포인트와 비호환.
+                   # 버전명 v9e/v9f인 이유: v9c/v9d/v10은 rsi-div-overhaul 브랜치 실험(보류됨)이 선점 —
                    # 이 라인은 v9b 로직 기반 + 결함 수정 경로
 
 DTYPE_V9 = [
@@ -81,6 +85,9 @@ DTYPE_V9 = [
     ("rsi_previous", "f4"),
     ("divergence_price_gap_percent", "f4"),
     ("rsi_divergence_gap", "f4"),            # 2026-08-02: 방향보정 RSI 갭(rsi1-rsi2, 성립 시 항상 양수) — 다이버전스 세기 그 자체
+    ("rsi_momentum_gap", "f4"),              # 2026-08-02 (v9f): 모멘텀 천장 갭 — last wave 내 RSI 극값과
+                                             # 파동 끝 봉 RSI의 방향보정 차이(항상 >=0). 파동마다 항상 정의되는
+                                             # 밀집 신호로, "가격은 극점인데 모멘텀은 이미 식는 중"을 연속값으로 계측
     ("relative_volume_strength", "f4"),      # 🚨 V8에서 0.0 하드코딩이던 버그 수정
     ("volatility_ratio", "f4"),
     ("adx_5m", "f4"),                        # 직전 마감 5m 캔들 기준
@@ -99,7 +106,8 @@ DTYPE_V9 = [
 REPORT_PERCENTILES = [1, 5, 25, 50, 75, 95, 99]
 REPORT_FIELDS = [
     "wave_scale_percent", "wave_duration_day", "rsi_previous",
-    "divergence_price_gap_percent", "rsi_divergence_gap", "relative_volume_strength",
+    "divergence_price_gap_percent", "rsi_divergence_gap", "rsi_momentum_gap",
+    "relative_volume_strength",
     "volatility_ratio", "adx_5m", "fib_pos", "wave_age_min",
     "rsi_now", "ret_5m", "ret_15m", "ret_1h",
 ]
@@ -241,6 +249,10 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
     memo_max_h_idx = -1
     memo_min_l_idx = -1
 
+    # 모멘텀 천장 갭 메모 (파동 구간/방향이 바뀔 때만 재계산 — 5m 캔들당 최대 1회)
+    mom_key = (-1, -1, False)
+    mom_gap_val = 0.0
+
     rows = []
     t_loop = time.time()
 
@@ -349,6 +361,20 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
                 rsi_div_gap = gap
                 has_divergence = True
 
+        # v9f: 모멘텀 천장 갭 — last wave(a_p2→a_p1) 구간에서 RSI가 가장 강했던 값과
+        # 파동 끝 봉 RSI의 차이(방향보정, 항상 >=0). 끝 봉이 forming이면 직전 마감봉으로
+        # 클램프(인과성 — 극값 탐색 창과 끝 봉이 같은 규칙으로 잘리므로 정의 일관).
+        # a_p2는 확정 피봇(index <= idx_5m-n)이라 창은 항상 비어있지 않음.
+        mom_end = min(a_p1["index"], idx_5m - 1)
+        mom_key_now = (a_p2["index"], mom_end, is_bullish)
+        if mom_key_now != mom_key:
+            seg_rsi = rsis_5m[a_p2["index"]:mom_end + 1]
+            if is_bullish:
+                mom_gap_val = float(seg_rsi.max() - rsis_5m[mom_end])
+            else:
+                mom_gap_val = float(rsis_5m[mom_end] - seg_rsi.min())
+            mom_key = mom_key_now
+
         prev_5m_idx = max(0, idx_5m - 1)
 
         # 🚨 볼륨 상대강도 (버그 수정): 파동 끝 피봇 캔들 볼륨의 트레일링 500캔들 백분위.
@@ -392,7 +418,7 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
             start_price, end_price,
             wave_scale, wave_duration_day,
             1 if has_divergence else 0,
-            rsi_prev, div_price_gap, rsi_div_gap,
+            rsi_prev, div_price_gap, rsi_div_gap, mom_gap_val,
             vol_strength, vol_ratio_arr[prev_5m_idx],
             adx_5m_arr[prev_5m_idx], atr_5m_arr[prev_5m_idx],
             fib_pos, 1 if wave_filter_hit else 0,

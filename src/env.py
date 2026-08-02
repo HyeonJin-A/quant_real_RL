@@ -29,7 +29,7 @@ import gymnasium as gym
 from gymnasium import spaces
 
 MARGIN_USDT = 100.0
-OBS_DIM = 19      # 파동/시장 피처 (다이버전스 발생 플래그 포함, wave_age_min 중복 제거).
+OBS_DIM = 20      # 파동/시장 피처 (다이버전스 발생 플래그 포함, wave_age_min 중복 제거).
                   # 2026-07-19: 포지션 상태 4칸 제거 — 옛 rule/adaptive 모드는 semi-MDP라 결정 시점에
                   # 항상 무포지션이어서 영원히 0인 죽은 차원이었음. "rl" 모드 전용으로만 유지.
                   # 2026-07-20: 타이밍 피처 4종 추가(14→18) — 현재 RSI(방향조정) + 트레일링
@@ -37,7 +37,9 @@ OBS_DIM = 19      # 파동/시장 피처 (다이버전스 발생 플래그 포�
                   # 이미 시작됐는지 판정할 정보 부재"(칼손절 즉사 분석)라는 진단에 따름.
                   # 2026-08-02: rsi_divergence_gap 추가(18→19, v9e 캐시 필수) — 다이버전스의
                   # 본질인 RSI 갭이 관측에 없던 결함 수정 (RSI-div-개편이전-핵심결함.md 결함 ②).
-RL_OBS_DIM = 23   # "rl" 모드(보유 중 매 스텝 결정) 전용: 파동/시장 19 + 포지션 상태 4
+                  # 2026-08-02: rsi_momentum_gap 추가(19→20, v9f 캐시 필수) — v9e에서 희소해진
+                  # 다이버전스 신호를 보완하는 밀집 모멘텀 감쇠 계측기 (파동마다 항상 정의).
+RL_OBS_DIM = 24   # "rl" 모드(보유 중 매 스텝 결정) 전용: 파동/시장 20 + 포지션 상태 4
 # 2026-07-20: rl 모드 자유 방향 선택(Open-Long/Short 구분, 옛 ACT_LONG/ACT_SHORT/ACT_CLOSE=3)
 # 폐기 — 방향은 fade 자동 고정, Discrete(4)→(3)으로 축소.
 ACT_HOLD, ACT_ENTER, ACT_CLOSE = 0, 1, 2
@@ -47,7 +49,8 @@ NORM = {
     "wave_scale_max": 12.0,       # % (전체 기간 분포 리포트 기준 BTC/ETH p99 ≈ 10.5~10.7 커버)
     "duration_log_max": np.log1p(10.0),   # 일
     "div_gap_max": 5.0,           # %
-    "rsi_gap_max": 20.0,          # pt — 방향보정 RSI 갭 (2026-08-02, v9e dist report로 재검증할 것)
+    "rsi_gap_max": 20.0,          # pt — 방향보정 RSI 갭 (2026-08-02, 풀 dist report p99 12.7~16.1 커버 확인)
+    "rsi_mom_gap_max": 30.0,      # pt — 모멘텀 천장 갭 (2026-08-02 v9f, dist report p99로 재검증할 것)
     "vol_ratio_log_max": np.log1p(6.0),
     "atr_pct_max": 3.0,           # atr/close %
     "hold_log_max": np.log1p(43200.0),       # 분 (30일, rl 모드 포지션 보유시간 정규화 전용)
@@ -130,7 +133,7 @@ class TradingEnvV9(gym.Env):
 
     @staticmethod
     def _build_static_obs(data):
-        """파동/시장 피처 OBS_DIM(19)차원을 전 행에 대해 사전 정규화 (스텝 시 행 슬라이스만 수행)"""
+        """파동/시장 피처 OBS_DIM(20)차원을 전 행에 대해 사전 정규화 (스텝 시 행 슬라이스만 수행)"""
         n = len(data)
         close = np.maximum(data["close"].astype(np.float64), 1e-9)
         is_bull = data["is_bullish"].astype(np.float64)
@@ -145,6 +148,8 @@ class TradingEnvV9(gym.Env):
         gap = np.clip(data["divergence_price_gap_percent"], 0, NORM["div_gap_max"]) / NORM["div_gap_max"]
         # 2026-08-02: 다이버전스 세기(방향보정 RSI 갭, 캐시 단계에서 성립 시 항상 양수) — v9e 캐시 필수
         rsi_gap = np.clip(data["rsi_divergence_gap"], 0, NORM["rsi_gap_max"]) / NORM["rsi_gap_max"]
+        # 2026-08-02 (v9f): 모멘텀 천장 갭 — has_div와 무관하게 파동마다 항상 정의되는 밀집 신호
+        mom_gap = np.clip(data["rsi_momentum_gap"], 0, NORM["rsi_mom_gap_max"]) / NORM["rsi_mom_gap_max"]
         vr = np.log1p(np.clip(data["volatility_ratio"], 0, 6.0)) / NORM["vol_ratio_log_max"]
         vs = np.clip(data["relative_volume_strength"], 0, 1)
         adx = np.clip(data["adx_5m"], 0, 100) / 100.0
@@ -176,8 +181,8 @@ class TradingEnvV9(gym.Env):
         r1h = np.clip(data["ret_1h"] * 100.0 / atr_pct_raw, -NORM["ret1h_atr_clip"], NORM["ret1h_atr_clip"]) / NORM["ret1h_atr_clip"]
 
         return np.stack(
-            [ws, dur, has_div, rsi_adj, gap, rsi_gap, vr, vs, adx, atr_pct, bull, fib, prehit, d5, d15,
-             rsi_now_adj, r5, r15, r1h],
+            [ws, dur, has_div, rsi_adj, gap, rsi_gap, mom_gap, vr, vs, adx, atr_pct, bull, fib, prehit,
+             d5, d15, rsi_now_adj, r5, r15, r1h],
             axis=1,
         ).astype(np.float32)
 
