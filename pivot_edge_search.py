@@ -6,18 +6,16 @@
 
 1. 각 피봇의 "확정 시점(T_confirm)"에서만 표본을 뽑는다.
    - t_peak(실제 극값 시점) 기준으로 재면 알고리즘 정의상 이미 반전이 보장된
-     시점이라 look-ahead bias가 생긴다. T_confirm(=N-bar + min_diff 조건이
-     충족되어 피봇이 확정된 캔들)부터 측정해야 "이 피봇을 믿고 진입했을 때"를
+     시점이라 look-ahead bias가 생긴다. T_confirm(= 거리 조건과 min_diff 조건이
+     동시에 충족되어 피봇이 확정된 캔들)부터 측정해야 "이 피봇을 믿고 진입했을 때"를
      평가할 수 있다.
-   - src/Algorithm.py::find_dynamic_pivots는 확정 시점을 반환하지 않으므로
-     (extreme 시점만 기록) 이 파일에서 동일 로직을 별도로 재구현해 confirm_idx를
-     함께 추적한다. 원본 로직은 절대 수정하지 않는다.
-   - 잔여 look-ahead 보정: N-bar 확정 조건(`low[i+1:i+n+1]` 등)은 트리거 캔들 i
-     이후 n개 캔들의 미래를 봐야 참/거짓이 갈리고, 그 n개 캔들 동안은 정의상
-     같은 방향으로의 갱신이 없음이 보장되어 있어 트리거 시점 i부터 수익률을
-     재면 fade에 불리한 인위적 편향이 생긴다(초기 버전에서 실제로 관측:
-     M이 작을수록 t-stat이 비정상적으로 더 음수). T_confirm = trigger_idx + n
-     으로 지연시켜 이 편향을 제거한다.
+   - 🚨 2026-08-01 변경: 예전엔 원본을 건드리지 않으려고 이 파일에서 검출 로직을
+     별도 재구현했었다. 그런데 원본(`algorithm.find_dynamic_pivots`)이 피봇 admission
+     룩어헤드 수정으로 전면 재작성되면서 **확정 규칙 자체가 바뀌었고**(N-bar 극점
+     검증 → 거리 `t−P>=n` AND 가격 `min_diff`의 단순 AND), `confirm_index`를 직접
+     반환하게 됐다. 재구현본을 그대로 두면 실측 기준 피봇의 약 10%가 다른 봉에 잡히고
+     확정 시점은 99.8%가 어긋나(중앙값 4봉) **탐색이 실제 쓰이는 정의와 다른 대상을
+     최적화**하게 된다. 그래서 재구현을 폐기하고 원본을 직접 호출한다.
 
 2. Fade Edge = -D_t * R[T_confirm -> T_confirm+M]
    - D_t: 직전 파동 방향 (고점 확정 = +1, 저점 확정 = -1)
@@ -33,6 +31,11 @@
    거리"를 특정 레버리지로 환산해 하드 컷오프를 거는 것은 성립하지 않는다.
    MAE는 하드 필터가 아니라 **생존 조합끼리 비교하는 정보성 지표**로만 쓴다
    (t-stat이 비슷하면 MAE가 작은, 덜 휩쏘 타는 쪽을 우선 고려하는 용도).
+
+3-b. 🚨 **train 구간만 사용** (2026-08-01 추가). 피봇 파라미터는 피처 정의의 일부이므로
+   valid/test를 보고 고르면 그 자체가 누수다 — 이전 탐색(07-17)이 전 구간을 썼기 때문에
+   "test에서도 성능이 안 떨어지는" 착시의 원인 중 하나로 지목됐다(design_spec 08-01 참고).
+   `eval.split_bounds`와 동일한 날짜 경계(전 심볼 공통 t_lo~t_hi의 70%)로 잘라서 탐색한다.
 
 4. 강건성 조건 — 아래를 모두 만족하는 (n, min_diff)만 "생존 조합"으로 채택:
    - 모든 서브기간(시간순 분할)에서 t_stat_adj > t-threshold
@@ -58,14 +61,21 @@ import pandas as pd
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
 DATA_DIR = os.path.join(ROOT_DIR, "data", "candle_data")
-OUT_DIR = os.path.join(os.path.dirname(__file__), "pivot_edge_search")
+CACHE_DIR = os.path.join(ROOT_DIR, "caches")
+OUT_DIR = os.path.join(ROOT_DIR, "pivot_edge_search")
+
+sys.path.insert(0, os.path.join(ROOT_DIR, "src"))
+from algorithm import find_dynamic_pivots  # noqa: E402  (v10 인과 검출기 — confirm_index 포함)
+
+# train 경계: eval.split_bounds와 동일 (전 심볼 공통 t_lo~t_hi의 70%)
+SPLIT_TRAIN_END = 0.70
 
 DEFAULT_N_GRID = [2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 20, 25]
 DEFAULT_MIN_DIFF_GRID = [0.005, 0.0075, 0.01, 0.0125, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05]
 DEFAULT_M_HOURS_GRID = [1, 2, 4, 6, 8, 10, 12, 16, 24, 36, 48]
-DEFAULT_SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
+DEFAULT_SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
 DEFAULT_SUBPERIODS = 4
 DEFAULT_MIN_N_EFF = 30
 
@@ -92,63 +102,36 @@ def load_candles(symbol: str, timeframe: str = DEFAULT_TIMEFRAME, recent_days: i
 # 피봇 확정 시점 추적 (src/Algorithm.py::find_dynamic_pivots와 동일 로직,
 # 단 confirm_idx를 추가로 기록한다. 원본 파일은 수정하지 않는다.)
 # ---------------------------------------------------------------------------
-def find_pivots_with_confirmation(high: np.ndarray, low: np.ndarray, n: int, min_diff: float):
+def find_pivots_with_confirmation(df: pd.DataFrame, n: int, min_diff: float):
+    """v10 원본 검출기(`algorithm.find_dynamic_pivots`)를 그대로 호출하는 얇은 어댑터.
+
+    🚨 여기서 로직을 재구현하지 말 것 — 탐색이 최적화하는 대상과 `prep_features`가
+    실제로 쓰는 대상이 어긋나면 튜닝 결과가 무의미해진다. 원본이 이미 `confirm_index`
+    (거리 조건과 min_diff 조건이 동시에 충족된 봉 = 그 시점 데이터만으로 판정 가능)를
+    반환하므로 별도 지연 보정도 불필요하다.
+
+    :return: list[dict(extreme_idx, confirm_idx, type, price)]
+             (아직 확정되지 않은 마지막 후보는 원본이 이미 제외해서 반환한다)
     """
-    :return: list[dict(extreme_idx, trigger_idx, confirm_idx, type, price)]
-             (마지막에 남는 미확정 curr_pivot은 포함하지 않음)
+    return [{"extreme_idx": p["index"], "confirm_idx": p["confirm_index"],
+             "type": p["type"], "price": p["price"]}
+            for p in find_dynamic_pivots(df, n=n, min_diff=min_diff)]
 
-    trigger_idx(=i)는 src/Algorithm.py::find_dynamic_pivots와 동일한 상태전이 시점 —
-    이 로직은 절대 변형하지 않는다(피봇 정의 자체가 달라지면 튜닝 결과가 무의미해짐).
 
-    confirm_idx는 trigger_idx와 다르다. is_*_n_bar 검사는 `low[i+1:i+n+1]`처럼
-    trigger_idx 이후 n개 캔들의 미래 데이터를 봐야 참/거짓이 갈리는 조건이라,
-    trigger_idx 시점엔 실시간으로 아직 검증 불가능하다(잔여 look-ahead).
-    또한 이 조건이 참이 되려면 정의상 trigger_idx 이후 n개 캔들 동안은 그 방향으로의
-    갱신이 없음이 보장되므로, R을 trigger_idx부터 재면 그 구간이 인위적으로
-    fade 방향에 불리하게 편향된다. confirm_idx = trigger_idx + n으로 지연시켜야
-    이 편향 없이 "실제로 알 수 있었던 시점부터"를 잴 수 있다.
+def train_end_ts(symbols: list[str], timeframe: str) -> pd.Timestamp:
+    """eval.split_bounds와 동일한 train 경계(전 심볼 공통 t_lo~t_hi의 70%)를 계산.
+
+    피봇 파라미터는 피처 정의의 일부라 valid/test를 보고 고르면 누수다.
+    경계 계산에만 전 심볼의 시작/끝 시각을 쓰고(값 자체를 보는 게 아님), 탐색은
+    이 경계 이전 구간으로만 수행한다.
     """
-    L = len(high)
-    pivots = []
-    curr_type = "high"
-    curr_idx = 0
-    curr_price = high[0]
-
-    for i in range(1, L):
-        hi = high[i]
-        lo = low[i]
-
-        if curr_type == "high":
-            if hi > curr_price:
-                curr_idx = i
-                curr_price = hi
-            elif lo < curr_price * (1 - min_diff):
-                lo_start = max(0, i - n)
-                hi_end = min(L, i + n + 1)
-                is_low_n_bar = np.all(lo < low[lo_start:i]) and np.all(lo < low[i + 1:hi_end])
-                if is_low_n_bar:
-                    pivots.append({"extreme_idx": curr_idx, "trigger_idx": i,
-                                    "confirm_idx": min(i + n, L - 1), "type": "high", "price": curr_price})
-                    curr_type = "low"
-                    curr_idx = i
-                    curr_price = lo
-
-        else:  # curr_type == "low"
-            if lo < curr_price:
-                curr_idx = i
-                curr_price = lo
-            elif hi > curr_price * (1 + min_diff):
-                lo_start = max(0, i - n)
-                hi_end = min(L, i + n + 1)
-                is_high_n_bar = np.all(hi > high[lo_start:i]) and np.all(hi > high[i + 1:hi_end])
-                if is_high_n_bar:
-                    pivots.append({"extreme_idx": curr_idx, "trigger_idx": i,
-                                    "confirm_idx": min(i + n, L - 1), "type": "low", "price": curr_price})
-                    curr_type = "high"
-                    curr_idx = i
-                    curr_price = hi
-
-    return pivots
+    lo, hi = None, None
+    for s in symbols:
+        ts = pd.read_csv(os.path.join(DATA_DIR, f"{s}_{timeframe}.csv"), usecols=["ts"])["ts"]
+        ts = pd.to_datetime(ts, errors="coerce").dropna()
+        lo = ts.min() if lo is None else min(lo, ts.min())
+        hi = ts.max() if hi is None else max(hi, ts.max())
+    return lo + (hi - lo) * SPLIT_TRAIN_END
 
 
 # ---------------------------------------------------------------------------
@@ -232,18 +215,24 @@ def run_search(symbols, n_grid, min_diff_grid, m_hours_grid, n_subperiods,
     bar_minutes = TIMEFRAME_MINUTES[timeframe]
     rows = []
 
+    t_train_end = train_end_ts(symbols, timeframe)
+    print(f"train 경계(전 심볼 공통 {SPLIT_TRAIN_END:.0%}): ~ {t_train_end}  — 이후 구간은 탐색에서 제외\n")
+
     for symbol in symbols:
         print(f"[{symbol}] loading {timeframe} candles...")
         df = load_candles(symbol, timeframe=timeframe, recent_days=recent_days)
+        n_all = len(df)
+        df = df[df["ts"] < t_train_end].reset_index(drop=True)   # 🚨 train 구간만
         high = df["high"].to_numpy(dtype=np.float64)
         low = df["low"].to_numpy(dtype=np.float64)
         close = df["close"].to_numpy(dtype=np.float64)
         L = len(df)
         boundaries = [int(L * (k + 1) / n_subperiods) for k in range(n_subperiods - 1)]
-        print(f"[{symbol}] {L} bars, {n_subperiods} subperiods, boundaries={boundaries}")
+        print(f"[{symbol}] {L} bars (전체 {n_all} 중 train만), "
+              f"{n_subperiods} subperiods, boundaries={boundaries}")
 
         for n, min_diff in itertools.product(n_grid, min_diff_grid):
-            pivots = find_pivots_with_confirmation(high, low, n, min_diff)
+            pivots = find_pivots_with_confirmation(df, n, min_diff)
             print(f"[{symbol}] n={n} min_diff={min_diff:.3f} -> {len(pivots)} pivots")
             if not pivots:
                 continue
