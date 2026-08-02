@@ -58,9 +58,11 @@ LOG_DIR = os.path.join(ROOT_DIR, "logs")
 LR_START = 3e-4
 
 
-MODE_SUBDIR = "v9_maskablerl"  # 2026-07-27: action masking(MaskablePPO) 도입으로 정책 클래스가
-                               # 바뀌어 기존 v9_fullctrl/ 체크포인트와 완전 비호환이라 별도 경로로 분리
-                               # (구 v9_fullctrl/ 산출물은 과거 기록으로 그대로 보존).
+MODE_SUBDIR = "v10_maskablerl"  # 2026-08-03: RSI-다이버전스 버그 2종 수정(algorithm.py/prep_features.py,
+                                # RSI-div-개편이전-핵심결함.md) 이후 첫 학습 라인 — 이전 v9_maskablerl/
+                                # 산출물과 피처 캐시가 달라 비교 기준이 바뀌므로 이름으로 세대를 구분.
+                                # 정책 클래스(MaskablePPO)·행동공간은 불변, 구분은 순전히 명명 목적.
+                                # (구 v9_maskablerl/ 산출물은 과거 기록으로 그대로 보존)
 
 
 def make_env_fn(cache_path, lo, hi, episode_len_rows, decision_stride, seed, env_kwargs, worker_idx=0,
@@ -381,7 +383,7 @@ def main():
     # models/ 체크포인트(best/final 포함)가 이전 런 산출물을 덮어쓰는 사고 방지.
     # 2026-07-20: 서버 로컬시간(UTC) 대신 KST로 표기.
     log_subdir = MODE_SUBDIR
-    run_name = f"v9_maskablerl_seed{args.seed}_{datetime.now(ZoneInfo('Asia/Seoul')).strftime('%m%d-%H%M')}"
+    run_name = f"v10_maskablerl_seed{args.seed}_{datetime.now(ZoneInfo('Asia/Seoul')).strftime('%m%d-%H%M')}"
     print(f"run_name: {run_name}")
     model = MaskablePPO(
         "MlpPolicy",

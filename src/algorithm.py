@@ -2,115 +2,69 @@ import pandas as pd
 import numpy as np
 
 def find_dynamic_pivots(df, n=10, min_diff=0.05):
+    """시간 오름차순 캔들에서 피봇을 인과적으로 검출한다. (2026-08-03 재작성 — 피봇 admission 룩어헤드 버그 수정)
+
+    피봇 확정 조건은 두 개의 AND — 둘 다 그 시점 데이터만으로 판정 가능하다:
+      (a) 거리:  t − P >= n        (P로부터 최소 n봉 경과)
+      (b) 가격:  가격이 P로부터 min_diff 이상 반대 방향으로 이동
+
+    같은 방향으로 더 극단이 나오면 후보를 즉시 그 봉으로 갱신한다(지연 없음).
+
+    🚨 구버전의 결함: 확정 조건이 "t−P >= n"이 아니라 "봉 i가 앞뒤 n봉 중 극점"(N-Bar)이었고
+    그 판정이 `iloc[i+1:i+n+1]`로 미래 n봉을 참조했다. 게다가 `prep_features`가 이 함수를
+    시간 역순 df에 적용한 뒤 인덱스를 되돌리는 방식이었는데, 대칭 N-Bar 판정을 역순에 걸면
+    원래 시간축 기준으로는 오히려 미래 확정을 더 크게 앞당기는 결과가 됐다. 그리고 그 바깥의
+    admission 가드(`prep_features`)가 (a) 거리 조건만 보고 (b) 가격 조건을 빼먹어, 반등이
+    min_diff에 도달하기도 전에 피봇을 확정 처리했다 — 반등이 늦게 오는 파동일수록 미래를
+    크게 앞당겨 썼다(실측 최대 47봉=3.9시간). 이번 재작성은 정순 1회 순회로 검출해
+    두 조건을 모두 만족한 봉을 즉시 confirm_index로 기록하는 구조로 이 결함을 근본 해결한다.
+
+    :param df: 시간 오름차순 캔들 (필수 컬럼 high/low, 선택 ts)
+    :param n: 피봇 간 최소 캔들 간격
+    :param min_diff: 방향 전환으로 인정할 가격 비율
+    :return: [{'index', 'type', 'price', 'confirm_index', 'time'}] — 확정된 피봇만.
+        confirm_index = 이 피봇이 확정된 봉. **그 봉까지의 데이터만으로 판정 가능**하므로
+        호출부는 `confirm_index <= 현재봉`인 피봇만 사용하면 인과성이 보장된다.
+        아직 확정되지 않은 마지막 후보는 포함하지 않는다(호출부가 forming 극점으로 별도 추적).
     """
-    :param df: 시간순으로 정렬된 캔들 데이터
-    :param n: N-Bar 알고리즘변수 (피봇 간격이 최소 N개 캔들)
-    :param min_diff: 피봇 방향 전환 조건이 되는 가격 비율
-    :return:
-    """
+    highs = df['high'].to_numpy(dtype=float)
+    lows = df['low'].to_numpy(dtype=float)
+    idx = df.index.to_numpy()
+    ts = df['ts'].to_numpy() if 'ts' in df.columns else None
+
     pivots = []
-    curr_type = 'high'  # 초기 방향 설정 (상황에 따라 low로 시작 가능)
-    first_idx = int(df.index[0])
-    curr_pivot = {'index': first_idx, 'time': str(df['ts'].iloc[0]), 'type': 'high', 'price': df['high'].iloc[0]}
+    if len(df) == 0:
+        return pivots
+
+    curr_type = 'high'          # 초기 방향 (첫 전환에서 실제 구조에 맞춰 정렬됨)
+    curr_i = 0                  # 후보의 위치 인덱스
+    curr_price = highs[0]
 
     for i in range(1, len(df)):
-        index_i = int(df.iloc[i].name)
-        high_i = float(df['high'].iloc[i])
-        low_i = float(df['low'].iloc[i])
-        ts_i = str(df['ts'].iloc[i])
-
         if curr_type == 'high':
-            # 1. 단순 가격 갱신: N-Bar 상관없이 더 높으면 무조건 업데이트
-            if high_i > curr_pivot['price']:
-                curr_pivot = {'index': index_i, 'time': ts_i, 'type': 'high', 'price': high_i}
+            if highs[i] > curr_price:
+                curr_i, curr_price = i, highs[i]          # 후보 갱신 (지연 없음)
+            elif lows[i] < curr_price * (1 - min_diff) and (i - curr_i) >= n:
+                pivots.append({
+                    'index': int(idx[curr_i]), 'type': 'high', 'price': float(curr_price),
+                    'confirm_index': int(idx[i]),
+                    'time': str(ts[curr_i]) if ts is not None else None,
+                })
+                curr_type = 'low'
+                curr_i, curr_price = i, lows[i]
+        else:
+            if lows[i] < curr_price:
+                curr_i, curr_price = i, lows[i]
+            elif highs[i] > curr_price * (1 + min_diff) and (i - curr_i) >= n:
+                pivots.append({
+                    'index': int(idx[curr_i]), 'type': 'low', 'price': float(curr_price),
+                    'confirm_index': int(idx[i]),
+                    'time': str(ts[curr_i]) if ts is not None else None,
+                })
+                curr_type = 'high'
+                curr_i, curr_price = i, highs[i]
 
-            # 2. 전환 조건: 충분히 하락했고 + N-Bar 저점 조건 만족 시
-            elif (low_i < curr_pivot['price'] * (1 - min_diff)):
-                is_low_n_bar = all(low_i < df['low'].iloc[i - n:i]) and \
-                               all(low_i < df['low'].iloc[i + 1:i + n + 1])
-                if is_low_n_bar:
-                    pivots.append(curr_pivot)  # 고점 확정
-                    curr_type = 'low'
-                    curr_pivot = {'index': index_i, 'time': ts_i, 'type': 'low', 'price': low_i}
-
-        elif curr_type == 'low':
-            # 1. 단순 가격 갱신: 더 낮으면 무조건 업데이트
-            if low_i < curr_pivot['price']:
-                curr_pivot = {'index': index_i, 'time': ts_i, 'type': 'low', 'price': low_i}
-
-            # 2. 전환 조건: 충분히 상승했고 + N-Bar 고점 조건 만족 시
-            elif (high_i > curr_pivot['price'] * (1 + min_diff)):
-                is_high_n_bar = all(high_i > df['high'].iloc[i - n:i]) and \
-                                all(high_i > df['high'].iloc[i + 1:i + n + 1])
-                if is_high_n_bar:
-                    pivots.append(curr_pivot)  # 저점 확정
-                    curr_type = 'high'
-                    curr_pivot = {'index': index_i, 'time': ts_i, 'type': 'high', 'price': high_i}
-
-    pivots.append(curr_pivot)
     return pivots
-
-
-def get_pivots_with_extreme_candle(df, pivots, min_diff=0.03):
-    """
-    현재 시점에서 가장 최근의 극점(extreme_candle)을 찾고 pivot 목록에 추가하여 반환함
-    :param df: 시간 역순으로 정렬된 캔들 데이터
-    :param pivots: 시간 역순으로 정렬된 피봇 목록
-    :param min_diff: 최신피봇과 신규극점의 최소 차이
-    """
-    if not pivots or len(pivots) < 2:
-        return pivots
-
-    # 피봇이 너무 최신이면 극점 업데이트 안함
-    if pivots[0]['index'] < 4:
-        return pivots
-
-    # 데이터 슬라이싱 후 극값 추적 (최신 피봇 자체는 제외)
-    last_pivot = pivots[0]
-    pivot_idx = last_pivot['index']
-    post_pivot_df = df.loc[:pivot_idx - 1]
-
-    if post_pivot_df.empty:
-        return pivots
-
-    extreme_type = 'high' if (last_pivot['type'] == 'low') else 'low'
-    extreme_idx = (post_pivot_df['high'].idxmax() if extreme_type == 'high'
-                   else post_pivot_df['low'].idxmin())
-
-    last_pivot_price = pivots[0]['price']
-    extreme_candle_price = float(df[extreme_type].loc[extreme_idx])
-
-    # 최신피봇과 신규극점의 가격 차이가 min_diff 미만이면 극점 업데이트 안함
-    if abs(last_pivot_price - extreme_candle_price) < min(last_pivot_price, extreme_candle_price) * min_diff:
-        return pivots
-
-    extreme_candle = {
-        'index': extreme_idx,
-        'time': df['ts'].loc[extreme_idx],
-        'type': extreme_type,
-        'price': float(df[extreme_type].loc[extreme_idx]),
-    }
-    return [extreme_candle] + pivots
-
-
-def calc_fibo_levels(p1, p2):
-    diff = abs(p1 - p2)
-    # 피보나치 기본 비율
-    ratios = [0.382, 0.5, 0.618]
-    levels = {}
-
-    if p1 < p2:
-        # 상승 후 되돌림 (Retracement from High)
-        # 고점에서 얼마나 내려오는지 계산
-        for r in ratios:
-            levels[str(r)] = round(p2 - (diff * r), 2)
-    else:
-        # 하락 후 반등 (Rebound from Low)
-        # 저점에서 얼마나 올라오는지 계산
-        for r in ratios:
-            levels[str(r)] = round(p2 + (diff * r), 2)
-
-    return levels
 
 
 def check_rsi_divergence(df, pivots, min_candle_dist=5):
@@ -162,124 +116,3 @@ def check_rsi_divergence(df, pivots, min_candle_dist=5):
                 'candle2': extreme_candle,
             }
     return False, None
-
-
-def get_relative_volume_strength(df, target_idx, period=500):
-    """
-    특정 캔들의 거래량 상대강도를 계산합니다.
-
-    [입력]
-    - df: 캔들 데이터프레임 (필수 컬럼: 'volume')
-    - target_idx: 계산할 캔들의 인덱스
-    - period: 이동평균을 구할 기간 (기본값 20)
-
-    [출력]
-    - 상대강도 백분위
-    """
-    # 타겟 캔들까지의 거래량 슬라이싱 (period 개수만큼)
-    # iloc를 사용하여 인덱스 기준으로 정확히 추출
-    volume_window = df['volume'].iloc[target_idx: target_idx + period]
-
-    min_vol = volume_window.min()
-    max_vol = volume_window.max()
-    current_vol = df['volume'].iloc[target_idx]
-
-    # 0으로 나누는 경우 방지
-    if max_vol == min_vol:
-        return 0.0
-
-    if min_vol == 0:
-        min_vol = 1
-
-    # Min-Max 공식: (x - min) / (max - min)
-    strength = (current_vol - min_vol) / (max_vol - min_vol)
-
-    # 1.0을 초과하거나 0.0 미만일 수 있으므로 클리핑(범위 제한)
-    return round(max(0.0, min(1.0, float(strength))), 3)
-
-
-def normalize(value, min_val, max_val, is_positive=True, max_score=10.0):
-    """
-    모든 스코어 항목을 0 ~ max_score 사이로 정규화하는 함수
-    :param value: 현재 측정값
-    :param min_val: 스코어 0이 되는 기준점 (하한선)
-    :param max_val: 최고 점수(max_score)가 되는 기준점 (상한선)
-    :param is_positive: True면 높은 값이 더 높은 점수
-    :param max_score: 해당 항목의 만점 (가중치 배점)
-    """
-    # 1. 이상치 방어 (Clipping)
-    # value가 min_val보다 작으면 min_val로, max_val보다 크면 max_val로 고정합니다.
-    # 즉, 10% 이상이 들어와도 10%로 처리되어 무조건 만점을 받게 됩니다.
-    clipped_value = np.clip(value, min_val, max_val)
-
-    # 2. 0.0 ~ 1.0 사이로 기본 정규화
-    if max_val == min_val:  # 0으로 나누기 방지
-        return 0.0
-    score = (clipped_value - min_val) / (max_val - min_val)
-
-    # 3. 역방향 처리 (낮을수록 좋은 지표)
-    if not is_positive:
-        score = 1.0 - score
-
-    # 4. 배점(max_score)을 곱해주고 소수점 둘째 자리까지 반올림
-    return round(score * max_score, 2)
-
-
-def calc_rule_based_score(last_wave, interval="15m", custom_scoring=None, custom_weights=None):
-    from Const import INTERVAL_SETTINGS
-
-    settings = INTERVAL_SETTINGS.get(interval, INTERVAL_SETTINGS["15m"])
-    sc = custom_scoring if custom_scoring else settings.get("scoring", {
-        "wave_scale_min": 1.0,
-        "wave_scale_max": 5.0,
-        "wave_duration_min": 0.1,
-        "wave_duration_max": 3.0,
-        "div_price_gap_max": 3.0,
-        "vol_strength_max": 0.5,
-        "vol_ratio_min": 1.5,
-        "vol_ratio_max": 3.0,
-        "adx_min": 15.0,
-        "adx_max": 35.0
-    })
-    
-    w = custom_weights if custom_weights else settings.get("weights", {
-        "wave_scale": 15.0,
-        "wave_duration": 10.0,
-        "rsi_base": 15.0,
-        "rsi_str": 10.0,
-        "rsi_gap": 10.0,
-        "vol_str": 10.0,
-        "vol_ratio": 15.0,
-        "adx": 15.0
-    })
-
-    score = 0
-
-    # 1. wave 형태 (Wave Scale & Duration)
-    score += normalize(last_wave['wave_scale_percent'], sc['wave_scale_min'], sc['wave_scale_max'], is_positive=True, max_score=w['wave_scale'])
-    score += normalize(last_wave['wave_duration_day'], sc['wave_duration_min'], sc['wave_duration_max'], is_positive=True, max_score=w['wave_duration'])
-
-    # 2. RSI 다이버전스 (RSI Divergence)
-    rsi_info = last_wave['rsi']
-    if rsi_info['rsi_divergence']:
-        score += w['rsi_base']
-
-        # RSI 스케일 0~100 대응을 위한 역방향 처리
-        rsi = rsi_info['rsi_previous'] if last_wave['wave_direction_is_bullish'] else 100 - rsi_info['rsi_previous']
-        rsi_score_val = rsi - 70
-        score += normalize(rsi_score_val, 0, 10, is_positive=True, max_score=w['rsi_str'])
-
-        score += normalize(rsi_info['divergence_price_gap_percent'], 0, sc['div_price_gap_max'], is_positive=False, max_score=w['rsi_gap'])
-
-    # 3. 거래량 상대강도 (Volume Strength)
-    score += normalize(last_wave['relative_volume_strength_of_the_latest_pivot'], 0.0, sc.get('vol_strength_max', 1.0), is_positive=True, max_score=w['vol_str'])
-    
-    # 4. 변동성 폭발 (Volatility Ratio)
-    vol_ratio = last_wave.get('volatility_ratio', 1.0)
-    score += normalize(vol_ratio, sc.get('vol_ratio_min', 1.5), sc.get('vol_ratio_max', 2.5), is_positive=True, max_score=w['vol_ratio'])
-
-    # 5. ADX 추세 강도
-    adx_val = last_wave.get('adx', 0.0)
-    score += normalize(adx_val, sc.get('adx_min', 15.0), sc.get('adx_max', 35.0), is_positive=True, max_score=w['adx'])
-
-    return round(float(score), 2)

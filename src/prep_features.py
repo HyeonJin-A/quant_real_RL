@@ -51,7 +51,13 @@ PRE_HIT_LEVEL = 0.382
 VOL_STRENGTH_PERIOD = 500
 WARMUP_5M = 200
 
-CACHE_VER = "v9b"  # 2026-07-20: 타이밍 피처 4종(rsi_now, ret_5m/15m/1h) 추가 — 구 v9 캐시/체크포인트와 비호환이라 파일명 분리
+CACHE_VER = "v9bx"  # 2026-08-03: v9b에서 버그 2개만 수정 — 신규 피처/필터는 도입하지 않음.
+                    # ① 다이버전스 (가격,RSI) 짝 불일치: 합성 극점 피봇 index를 실제 극점 봉으로
+                    #    기록해 rsi2를 그 봉에서 읽음(forming 봉이 극점이면 판정 보류).
+                    # ② 피봇 admission 룩어헤드(min_diff 가드 없음): find_dynamic_pivots를
+                    #    confirm_index 기반 정순 인과 검출로 재작성(algorithm.py), 여기서도
+                    #    admission을 confirm_index 기준으로 교체. 스키마(25컬럼)·관측(18+4차원)은
+                    #    v9b와 동일 — 순수 버그 수정 비교용.
 
 DTYPE_V9 = [
     ("i_1m", "i4"),
@@ -193,15 +199,12 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
     # trades_per_month(1000배), yearly_breakdown(1970년) 등이 연쇄로 깨졌었음.
     ts_1m_ms = (df_1m["ts_dt"].astype("datetime64[ns]").astype("int64") // 10**6).values
 
-    # --- 전역 피봇 (V8과 동일: 내림차순 df에서 감지 후 오름차순 인덱스로 변환) ---
+    # --- 전역 피봇 (버그② 수정: 시간 오름차순 인과 검출) ---
+    # 구버전은 내림차순 df에 검출기를 돌린 뒤 인덱스를 되돌렸다 — 대칭 N-Bar 판정을 역순에
+    # 걸면 원래 시간축 기준으로는 오히려 확정을 더 앞당기는 결과가 됐다(algorithm.py 참고).
+    # 정순 1회 순회로 검출하고 각 피봇의 confirm_index(확정 봉)를 함께 받는다.
     print("Calculating global pivots on 5m...")
-    df_5m_desc = df_5m.iloc[::-1].reset_index(drop=True)
-    global_pivots_desc = find_dynamic_pivots(df_5m_desc, n=n, min_diff=min_diff)
-    global_pivots = sorted(
-        ({"index": total_5m - 1 - p["index"], "type": p["type"], "price": p["price"]}
-         for p in global_pivots_desc),
-        key=lambda x: x["index"],
-    )
+    global_pivots = find_dynamic_pivots(df_5m, n=n, min_diff=min_diff)
     print(f"pivots: {len(global_pivots)}  ({time.time() - t0:.1f}s)")
 
     # --- 1m 순회: 파동 매핑 + 피처 추출 ---
@@ -219,9 +222,13 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
     wave_born_ms = -1
 
     # 마감 캔들 구간 극값 메모 (idx_5m/피봇이 바뀔 때만 재계산)
+    # 버그① 수정: 극값과 함께 극점 봉 인덱스도 추적 — 합성 피봇이 실제 극점 봉을 가리키게 해
+    # (가격, RSI)를 같은 봉에서 읽는다
     memo_key = (-1, -1)
     memo_max_h = 0.0
     memo_min_l = 1e18
+    memo_max_h_idx = -1
+    memo_min_l_idx = -1
 
     rows = []
     t_loop = time.time()
@@ -244,7 +251,11 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
         if lows_1m[i] < forming_low:
             forming_low = lows_1m[i]
 
-        while pivot_ptr < len(global_pivots) and global_pivots[pivot_ptr]["index"] <= idx_5m - n:
+        # 버그② 수정 (admission 가드): 구버전은 `index <= idx_5m - n`으로 거리 조건만 보고
+        # 가격 조건(min_diff)을 빼먹어, 반등이 min_diff에 도달하기 전에 피봇을 확정 처리했다
+        # (실측 최대 47봉=3.9시간 미래 선행). 검출기가 두 조건을 모두 만족한 봉을
+        # confirm_index로 알려주므로, 그 봉이 마감된 뒤에만 사용한다.
+        while pivot_ptr < len(global_pivots) and global_pivots[pivot_ptr]["confirm_index"] < idx_5m:
             pivot_ptr += 1
         if pivot_ptr < 2:
             continue
@@ -257,20 +268,45 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
         extreme_type = "high" if p1["type"] == "low" else "low"
         if p1_idx + 1 <= idx_5m - 1:
             if memo_key != (p1_idx, idx_5m):
-                memo_max_h = highs_5m[p1_idx + 1:idx_5m].max()
-                memo_min_l = lows_5m[p1_idx + 1:idx_5m].min()
+                seg_h = highs_5m[p1_idx + 1:idx_5m]
+                seg_l = lows_5m[p1_idx + 1:idx_5m]
+                off_h = int(seg_h.argmax())
+                off_l = int(seg_l.argmin())
+                memo_max_h = seg_h[off_h]
+                memo_min_l = seg_l[off_l]
+                memo_max_h_idx = p1_idx + 1 + off_h
+                memo_min_l_idx = p1_idx + 1 + off_l
                 memo_key = (p1_idx, idx_5m)
+            # 버그① 수정: forming 봉은 마감 구간 극값을 '초과'할 때만 극점(동률이면 RSI가
+            # 존재하는 마감봉 우선). p1 자신이 극값이면 diff=0이라 어차피 합성 안 됨.
             if extreme_type == "high":
                 extreme_price = max(p1["price"], memo_max_h, forming_high)
+                if forming_high > max(memo_max_h, p1["price"]):
+                    extreme_idx = idx_5m
+                elif memo_max_h >= p1["price"]:
+                    extreme_idx = memo_max_h_idx
+                else:
+                    extreme_idx = p1_idx
             else:
                 extreme_price = min(p1["price"], memo_min_l, forming_low)
+                if forming_low < min(memo_min_l, p1["price"]):
+                    extreme_idx = idx_5m
+                elif memo_min_l <= p1["price"]:
+                    extreme_idx = memo_min_l_idx
+                else:
+                    extreme_idx = p1_idx
         else:
-            extreme_price = (max(p1["price"], forming_high) if extreme_type == "high"
-                             else min(p1["price"], forming_low))
+            if extreme_type == "high":
+                extreme_price = max(p1["price"], forming_high)
+                extreme_idx = idx_5m if forming_high > p1["price"] else p1_idx
+            else:
+                extreme_price = min(p1["price"], forming_low)
+                extreme_idx = idx_5m if forming_low < p1["price"] else p1_idx
 
         diff_val = abs(p1["price"] - extreme_price)
         if diff_val >= min(p1["price"], extreme_price) * min_diff:
-            active_pivots = [{"index": idx_5m, "type": extreme_type, "price": extreme_price}] + last_pivots_desc
+            # 버그① 수정: 합성 피봇 index를 idx_5m(현재 봉)이 아닌 실제 극점 봉으로 기록
+            active_pivots = [{"index": extreme_idx, "type": extreme_type, "price": extreme_price}] + last_pivots_desc
         else:
             active_pivots = last_pivots_desc
 
@@ -283,16 +319,17 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
         wave_scale = abs(end_price - start_price) / start_price * 100
         wave_duration_day = max(0.001, (a_p1["index"] - a_p2["index"]) * 5 / (60 * 24))
 
-        # RSI 다이버전스 (V7과 동일) + 발생 여부 명시 플래그
+        # RSI 다이버전스 — 버그① 수정판: rsi2를 실제 극점 봉(a_p1)에서 읽고, 극점이 forming
+        # 봉(index == idx_5m)이면 RSI 미확정이라 판정을 보류한다(구 클램프 폐지). 그 외 조건
+        # (필터·신규 컬럼 없음)은 v9b와 동일 — 이번 수정 범위는 버그 2개로 한정.
         rsi_prev = 50.0
         div_price_gap = 0.0
         has_divergence = False
-        if len(active_pivots) >= 3:
+        if len(active_pivots) >= 3 and a_p1["index"] < idx_5m:
             a_p3 = active_pivots[2]
             if a_p3["type"] == a_p1["type"]:
                 rsi1 = rsis_5m[a_p3["index"]]
-                rsi2_idx = a_p1["index"] if a_p1["index"] < idx_5m else max(0, idx_5m - 1)
-                rsi2 = rsis_5m[rsi2_idx]
+                rsi2 = rsis_5m[a_p1["index"]]
                 pr1, pr2 = a_p3["price"], a_p1["price"]
                 if (is_bullish and pr2 > pr1 and rsi2 < rsi1) or \
                    (not is_bullish and pr2 < pr1 and rsi2 > rsi1):

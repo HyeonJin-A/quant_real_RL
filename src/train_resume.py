@@ -198,7 +198,7 @@ def main():
 
     vec_env = DummyVecEnv(env_fns) if args.dummy_vec else SubprocVecEnv(env_fns, start_method="spawn")
 
-    run_name = f"v9_maskablerl_seed{args.seed}_{datetime.now(ZoneInfo('Asia/Seoul')).strftime('%m%d-%H%M')}_resume"
+    run_name = f"v10_maskablerl_seed{args.seed}_{datetime.now(ZoneInfo('Asia/Seoul')).strftime('%m%d-%H%M')}_resume"
     print(f"run_name: {run_name}")
 
     # 저장 경로: models|logs/resume/{원본 체크포인트 run_name}/{이번 resume run_name}/...
