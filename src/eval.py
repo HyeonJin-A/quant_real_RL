@@ -45,8 +45,11 @@ NEAR_LIQUIDATION_THRESHOLD = -95.0  # 증거금(100) 거의 다 날린 거래 �
 
 def cache_path_for(symbol, suffix=""):
     # 2026-07-20: v9b — 타이밍 피처 4종 추가판. 구 v9 캐시는 구 체크포인트 평가용으로 보존
+    # 2026-08-02: v9e — 다이버전스 짝 복원 + rsi_divergence_gap 추가 (관측 18→19).
+    # v9b 체크포인트는 관측 차원 불일치로 로드 불가 — 구 체크포인트 평가는 구 커밋 체크아웃으로.
+    # (v9c/v9d/v10은 rsi-div-overhaul 브랜치 실험이 선점한 버전명이라 v9e로 명명)
     # (단, 구 체크포인트 평가는 당시 코드(git) 기준으로만 유효 — 관측 차원이 다름)
-    return os.path.join(CACHE_DIR, f"features_v9b_{symbol}{suffix}.npy")
+    return os.path.join(CACHE_DIR, f"features_v9e_{symbol}{suffix}.npy")
 
 
 def split_bounds(cache_paths, final=False):

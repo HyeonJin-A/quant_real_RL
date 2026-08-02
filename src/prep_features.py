@@ -5,7 +5,11 @@ V9 피처 캐시 생성기 (V9 Design.md 3장, 4장)
 - V8(prep_features_v7.py)의 인과성 보장 구조를 계승:
   5m 파동을 1m 스냅샷에 매핑, 매 1m 행은 그 시점에 알 수 있었던 정보만 포함
 - V8 버그 수정: relative_volume_strength를 상수 0.0이 아닌 실제 계산값으로 기록
-  (자기 이력 500개 5m 캔들 내 min-max 백분위 — src/Algorithm.py get_relative_volume_strength와 동일 정의)
+  (자기 이력 500개 5m 캔들 내 min-max 백분위 — 구 algorithm.py get_relative_volume_strength와
+  동일 정의를 벡터화한 것. 원본 함수는 2026-08-02 죽은 코드 정리로 삭제됨)
+- 2026-08-02 (v9e): RSI 다이버전스 재작성 — 극점 봉 인덱스를 추적해 (가격, RSI)를 같은 봉에서
+  읽고, rsi_divergence_gap 컬럼 추가, 구조적 필터(min_candle_dist/min_rsi_gap) 복원.
+  상세: RSI-div-개편이전-핵심결함.md
 - 추가 컬럼: adx_5m/atr_5m(직전 마감 5m 캔들, RMA 방식 = backtest_v8.calculate_adx와 동일),
   fib_pos(파동 내 되돌림 위치), pre_hit_0382(0.382 선터치 플래그, simulate_numba와 동일 추적),
   wave_age_min(신규 파동 이후 경과 분)
@@ -51,7 +55,15 @@ PRE_HIT_LEVEL = 0.382
 VOL_STRENGTH_PERIOD = 500
 WARMUP_5M = 200
 
-CACHE_VER = "v9b"  # 2026-07-20: 타이밍 피처 4종(rsi_now, ret_5m/15m/1h) 추가 — 구 v9 캐시/체크포인트와 비호환이라 파일명 분리
+# 2026-08-02 다이버전스 구조적 필터 (RSI-div-개편이전-핵심결함.md).
+# RSI 70/30 임계는 하드 필터가 아니라 관측의 rsi_adj 피처로 학습에 위임.
+DIV_MIN_CANDLE_DIST = 5   # 두 극점 간 최소 5m봉 간격 (구버전 check_rsi_divergence의 min_candle_dist)
+DIV_MIN_RSI_GAP = 1.0     # 방향보정 RSI 갭 최소값 (pt) — 부동소수 수준 노이즈 컷
+
+CACHE_VER = "v9e"  # 2026-08-02: 다이버전스 (가격,RSI) 짝 복원 + rsi_divergence_gap 컬럼 추가
+                   # (RSI-div-개편이전-핵심결함.md) — 관측 차원 변경(18→19)으로 구 캐시/체크포인트와 비호환.
+                   # 버전명이 v9e인 이유: v9c/v9d/v10은 rsi-div-overhaul 브랜치 실험(보류됨)이 선점 —
+                   # 이 라인은 v9b 로직 기반 + 결함 수정 경로
 
 DTYPE_V9 = [
     ("i_1m", "i4"),
@@ -65,9 +77,10 @@ DTYPE_V9 = [
     ("end_price", "f4"),
     ("wave_scale_percent", "f4"),
     ("wave_duration_day", "f4"),
-    ("has_rsi_divergence", "i1"),             # 다이버전스 발생 여부. 0이면 rsi_previous=50.0, gap=0.0(무의미 기본값)
+    ("has_rsi_divergence", "i1"),             # 다이버전스 발생 여부. 0이면 rsi_previous=50.0, gap류=0.0(무의미 기본값)
     ("rsi_previous", "f4"),
     ("divergence_price_gap_percent", "f4"),
+    ("rsi_divergence_gap", "f4"),            # 2026-08-02: 방향보정 RSI 갭(rsi1-rsi2, 성립 시 항상 양수) — 다이버전스 세기 그 자체
     ("relative_volume_strength", "f4"),      # 🚨 V8에서 0.0 하드코딩이던 버그 수정
     ("volatility_ratio", "f4"),
     ("adx_5m", "f4"),                        # 직전 마감 5m 캔들 기준
@@ -86,7 +99,7 @@ DTYPE_V9 = [
 REPORT_PERCENTILES = [1, 5, 25, 50, 75, 95, 99]
 REPORT_FIELDS = [
     "wave_scale_percent", "wave_duration_day", "rsi_previous",
-    "divergence_price_gap_percent", "relative_volume_strength",
+    "divergence_price_gap_percent", "rsi_divergence_gap", "relative_volume_strength",
     "volatility_ratio", "adx_5m", "fib_pos", "wave_age_min",
     "rsi_now", "ret_5m", "ret_15m", "ret_1h",
 ]
@@ -175,7 +188,8 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
     vol_strength_arr = rolling_volume_strength(df_5m["volume"].values)
 
     if "rsi" not in df_5m.columns:
-        df_5m["rsi"] = 50.0
+        # 2026-08-02: 무음 50.0 폴백 제거 — 컬럼이 없으면 다이버전스 피처 전체가 조용히 죽으므로 명시적 실패
+        raise ValueError(f"[{symbol}] 5m CSV에 rsi 컬럼이 없음 — 다이버전스 피처를 만들 수 없음")
     rsis_5m = df_5m["rsi"].fillna(50.0).values
 
     highs_5m = df_5m["high"].values
@@ -219,9 +233,13 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
     wave_born_ms = -1
 
     # 마감 캔들 구간 극값 메모 (idx_5m/피봇이 바뀔 때만 재계산)
+    # 2026-08-02: 극값과 함께 극점 봉 인덱스도 추적 — 합성 피봇이 실제 극점 봉을 가리키게 해
+    # (가격, RSI)를 같은 봉에서 읽는다 (RSI-div-개편이전-핵심결함.md 결함 ①)
     memo_key = (-1, -1)
     memo_max_h = 0.0
     memo_min_l = 1e18
+    memo_max_h_idx = -1
+    memo_min_l_idx = -1
 
     rows = []
     t_loop = time.time()
@@ -257,20 +275,46 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
         extreme_type = "high" if p1["type"] == "low" else "low"
         if p1_idx + 1 <= idx_5m - 1:
             if memo_key != (p1_idx, idx_5m):
-                memo_max_h = highs_5m[p1_idx + 1:idx_5m].max()
-                memo_min_l = lows_5m[p1_idx + 1:idx_5m].min()
+                seg_h = highs_5m[p1_idx + 1:idx_5m]
+                seg_l = lows_5m[p1_idx + 1:idx_5m]
+                off_h = int(seg_h.argmax())
+                off_l = int(seg_l.argmin())
+                memo_max_h = seg_h[off_h]
+                memo_min_l = seg_l[off_l]
+                memo_max_h_idx = p1_idx + 1 + off_h
+                memo_min_l_idx = p1_idx + 1 + off_l
                 memo_key = (p1_idx, idx_5m)
+            # 극점 봉 인덱스: forming 봉은 마감 구간 극값을 '초과'할 때만 극점(동률이면 RSI가
+            # 존재하는 마감봉 우선). p1 자신이 극값이면 diff=0이라 어차피 합성 안 됨.
             if extreme_type == "high":
                 extreme_price = max(p1["price"], memo_max_h, forming_high)
+                if forming_high > max(memo_max_h, p1["price"]):
+                    extreme_idx = idx_5m
+                elif memo_max_h >= p1["price"]:
+                    extreme_idx = memo_max_h_idx
+                else:
+                    extreme_idx = p1_idx
             else:
                 extreme_price = min(p1["price"], memo_min_l, forming_low)
+                if forming_low < min(memo_min_l, p1["price"]):
+                    extreme_idx = idx_5m
+                elif memo_min_l <= p1["price"]:
+                    extreme_idx = memo_min_l_idx
+                else:
+                    extreme_idx = p1_idx
         else:
-            extreme_price = (max(p1["price"], forming_high) if extreme_type == "high"
-                             else min(p1["price"], forming_low))
+            if extreme_type == "high":
+                extreme_price = max(p1["price"], forming_high)
+                extreme_idx = idx_5m if forming_high > p1["price"] else p1_idx
+            else:
+                extreme_price = min(p1["price"], forming_low)
+                extreme_idx = idx_5m if forming_low < p1["price"] else p1_idx
 
         diff_val = abs(p1["price"] - extreme_price)
         if diff_val >= min(p1["price"], extreme_price) * min_diff:
-            active_pivots = [{"index": idx_5m, "type": extreme_type, "price": extreme_price}] + last_pivots_desc
+            # 2026-08-02: 합성 피봇 index를 idx_5m(현재 봉)이 아닌 실제 극점 봉으로 기록 —
+            # wave_duration_day / rsi2 / vol_idx가 모두 진짜 극점 봉 기준으로 계산되게 함
+            active_pivots = [{"index": extreme_idx, "type": extreme_type, "price": extreme_price}] + last_pivots_desc
         else:
             active_pivots = last_pivots_desc
 
@@ -283,22 +327,27 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
         wave_scale = abs(end_price - start_price) / start_price * 100
         wave_duration_day = max(0.001, (a_p1["index"] - a_p2["index"]) * 5 / (60 * 24))
 
-        # RSI 다이버전스 (V7과 동일) + 발생 여부 명시 플래그
+        # RSI 다이버전스 (2026-08-02 재작성 — RSI-div-개편이전-핵심결함.md)
+        # - 같은 봉의 (가격, RSI) 쌍 두 개를 비교: rsi1은 이전 극점(a_p3) 봉, rsi2는 최신 극점(a_p1) 봉.
+        # - 최신 극점이 forming 봉(index == idx_5m)이면 RSI 미확정이라 판정하지 않음(마감 후 확정).
+        # - 구 코드의 a_p3.type == a_p1.type 가드는 피봇 타입이 구조상 항상 교대라 no-op이어서 제거.
         rsi_prev = 50.0
         div_price_gap = 0.0
+        rsi_div_gap = 0.0
         has_divergence = False
-        if len(active_pivots) >= 3:
+        if len(active_pivots) >= 3 and a_p1["index"] < idx_5m:
             a_p3 = active_pivots[2]
-            if a_p3["type"] == a_p1["type"]:
-                rsi1 = rsis_5m[a_p3["index"]]
-                rsi2_idx = a_p1["index"] if a_p1["index"] < idx_5m else max(0, idx_5m - 1)
-                rsi2 = rsis_5m[rsi2_idx]
-                pr1, pr2 = a_p3["price"], a_p1["price"]
-                if (is_bullish and pr2 > pr1 and rsi2 < rsi1) or \
-                   (not is_bullish and pr2 < pr1 and rsi2 > rsi1):
-                    rsi_prev = rsi1
-                    div_price_gap = abs(pr2 - pr1) / pr1 * 100
-                    has_divergence = True
+            rsi1 = rsis_5m[a_p3["index"]]
+            rsi2 = rsis_5m[a_p1["index"]]
+            pr1, pr2 = a_p3["price"], a_p1["price"]
+            gap = (rsi1 - rsi2) if is_bullish else (rsi2 - rsi1)  # 방향보정: 다이버전스 성립 방향이 양수
+            if ((is_bullish and pr2 > pr1) or (not is_bullish and pr2 < pr1)) \
+                    and gap >= DIV_MIN_RSI_GAP \
+                    and a_p1["index"] - a_p3["index"] >= DIV_MIN_CANDLE_DIST:
+                rsi_prev = rsi1
+                div_price_gap = abs(pr2 - pr1) / pr1 * 100
+                rsi_div_gap = gap
+                has_divergence = True
 
         prev_5m_idx = max(0, idx_5m - 1)
 
@@ -343,7 +392,7 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
             start_price, end_price,
             wave_scale, wave_duration_day,
             1 if has_divergence else 0,
-            rsi_prev, div_price_gap,
+            rsi_prev, div_price_gap, rsi_div_gap,
             vol_strength, vol_ratio_arr[prev_5m_idx],
             adx_5m_arr[prev_5m_idx], atr_5m_arr[prev_5m_idx],
             fib_pos, 1 if wave_filter_hit else 0,
