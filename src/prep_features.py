@@ -29,7 +29,7 @@ SRC_DIR = os.path.abspath(os.path.dirname(__file__))
 ROOT_DIR = os.path.abspath(os.path.join(SRC_DIR, ".."))
 sys.path.insert(0, SRC_DIR)
 
-from algorithm import find_dynamic_pivots  # noqa: E402  (파동 감지 엔진은 V8과 동일한 것을 사용)
+from algorithm import find_dynamic_pivots, calc_rsi_divergence  # noqa: E402  (파동 감지 엔진은 V8과 동일한 것을 사용)
 
 DATA_DIR = os.path.join(ROOT_DIR, "data", "candle_data")
 CACHE_DIR = os.path.join(ROOT_DIR, "caches")
@@ -51,13 +51,21 @@ PRE_HIT_LEVEL = 0.382
 VOL_STRENGTH_PERIOD = 500
 WARMUP_5M = 200
 
-CACHE_VER = "v9bx"  # 2026-08-03: v9b에서 버그 2개만 수정 — 신규 피처/필터는 도입하지 않음.
-                    # ① 다이버전스 (가격,RSI) 짝 불일치: 합성 극점 피봇 index를 실제 극점 봉으로
-                    #    기록해 rsi2를 그 봉에서 읽음(forming 봉이 극점이면 판정 보류).
-                    # ② 피봇 admission 룩어헤드(min_diff 가드 없음): find_dynamic_pivots를
-                    #    confirm_index 기반 정순 인과 검출로 재작성(algorithm.py), 여기서도
-                    #    admission을 confirm_index 기준으로 교체. 스키마(25컬럼)·관측(18+4차원)은
-                    #    v9b와 동일 — 순수 버그 수정 비교용.
+CACHE_VER = "v9c"  # 2026-08-03: RSI 다이버전스 "last wave 외부 참조" 결함 수정
+                   # (RSI-div-개편이전-핵심결함.md) — v9bx(버그①②만 수정) 위에 적용.
+                   # 구버전은 last wave 끝(a_p1)과 전전 파동 끝(a_p3)을 비교(파동 바깥 참조).
+                   # a_p2~a_p1(last wave 내부)에서 RSI 극값을 찾아 파동 끝 RSI와 비교하는
+                   # 방식(algorithm.calc_rsi_divergence)으로 교체 — 임의 상수 없는 연속값,
+                   # 이벤트 플래그 폐지. 컬럼 3종 개명: has_rsi_divergence/rsi_previous/
+                   # divergence_price_gap_percent → div_rsi_gap/dist_from_div_peak_to_end/
+                   # div_price_gap. v9bx와 비호환(스키마 변경).
+                   #
+                   # v9bx (2026-08-03): v9b에서 버그 2개만 수정 — 신규 피처/필터는 도입하지 않음.
+                   # ① 다이버전스 (가격,RSI) 짝 불일치: 합성 극점 피봇 index를 실제 극점 봉으로
+                   #    기록해 rsi2를 그 봉에서 읽음(forming 봉이 극점이면 판정 보류).
+                   # ② 피봇 admission 룩어헤드(min_diff 가드 없음): find_dynamic_pivots를
+                   #    confirm_index 기반 정순 인과 검출로 재작성(algorithm.py), 여기서도
+                   #    admission을 confirm_index 기준으로 교체.
 
 DTYPE_V9 = [
     ("i_1m", "i4"),
@@ -71,9 +79,12 @@ DTYPE_V9 = [
     ("end_price", "f4"),
     ("wave_scale_percent", "f4"),
     ("wave_duration_day", "f4"),
-    ("has_rsi_divergence", "i1"),             # 다이버전스 발생 여부. 0이면 rsi_previous=50.0, gap=0.0(무의미 기본값)
-    ("rsi_previous", "f4"),
-    ("divergence_price_gap_percent", "f4"),
+    # --- RSI 다이버전스 3종 (2026-08-03 재설계, algorithm.calc_rsi_divergence 참고) ---
+    # 구버전의 (0/1 플래그 + rsi_previous + 가격갭) 조합을 대체. 발생/미발생 플래그가 없어져
+    # "미발생 시 rsi_previous=50.0" 같은 센티넬 값과 불연속이 사라졌다 — 셋 다 상시 유효한 연속값.
+    ("div_rsi_gap", "f4"),                   # 파동 내 RSI 극값 − 파동 끝 RSI (>=0). 0이면 확인(confirmation)
+    ("dist_from_div_peak_to_end", "f4"),     # RSI 극점 → 파동 끝 (일 단위, wave_duration_day와 동일 단위/정규화)
+    ("div_price_gap", "f4"),                 # RSI 극점 이후 가격이 추가로 이동한 폭 (%)
     ("relative_volume_strength", "f4"),      # 🚨 V8에서 0.0 하드코딩이던 버그 수정
     ("volatility_ratio", "f4"),
     ("adx_5m", "f4"),                        # 직전 마감 5m 캔들 기준
@@ -83,7 +94,7 @@ DTYPE_V9 = [
     ("wave_age_min", "f4"),
     # --- 2026-07-20 타이밍 피처 (승률 천장 ~27%의 원인이 "전환 시점 판정 정보 부재"라는
     # 진단에 따른 추가 — 60d 런 칼손절 즉사 분석 참고). 전부 과거 데이터만 사용(인과적). ---
-    ("rsi_now", "f4"),                       # 직전 마감 5m 캔들의 RSI (divergence용 rsi_previous와 별개로, "지금 과매수/과매도인가")
+    ("rsi_now", "f4"),                       # 직전 마감 5m 캔들의 RSI ("지금 과매수/과매도인가")
     ("ret_5m", "f4"),                        # close(t)/close(t-5분) - 1  (1m 종가 기준 트레일링 수익률)
     ("ret_15m", "f4"),                       # close(t)/close(t-15분) - 1
     ("ret_1h", "f4"),                        # close(t)/close(t-60분) - 1
@@ -91,8 +102,8 @@ DTYPE_V9 = [
 
 REPORT_PERCENTILES = [1, 5, 25, 50, 75, 95, 99]
 REPORT_FIELDS = [
-    "wave_scale_percent", "wave_duration_day", "rsi_previous",
-    "divergence_price_gap_percent", "relative_volume_strength",
+    "wave_scale_percent", "wave_duration_day", "div_rsi_gap",
+    "dist_from_div_peak_to_end", "div_price_gap", "relative_volume_strength",
     "volatility_ratio", "adx_5m", "fib_pos", "wave_age_min",
     "rsi_now", "ret_5m", "ret_15m", "ret_1h",
 ]
@@ -230,6 +241,12 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
     memo_max_h_idx = -1
     memo_min_l_idx = -1
 
+    # RSI 다이버전스 메모: (a_p2_idx, a_p1_idx)가 RSI 극점 탐색 구간을 완전히 결정하므로
+    # 이 조합이 바뀔 때만 argmax를 다시 돌린다 (조합은 5m 봉 마감 빈도로만 바뀜).
+    # 가격 갭은 파동 극점 가격(end_price)이 1m마다 갱신되므로 메모하지 않고 매 행 계산한다.
+    div_key = (-1, -1)
+    div_result = (0.0, 0, 0.0)
+
     rows = []
     t_loop = time.time()
 
@@ -319,25 +336,36 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
         wave_scale = abs(end_price - start_price) / start_price * 100
         wave_duration_day = max(0.001, (a_p1["index"] - a_p2["index"]) * 5 / (60 * 24))
 
-        # RSI 다이버전스 — 버그① 수정판: rsi2를 실제 극점 봉(a_p1)에서 읽고, 극점이 forming
-        # 봉(index == idx_5m)이면 RSI 미확정이라 판정을 보류한다(구 클램프 폐지). 그 외 조건
-        # (필터·신규 컬럼 없음)은 v9b와 동일 — 이번 수정 범위는 버그 2개로 한정.
-        rsi_prev = 50.0
-        div_price_gap = 0.0
-        has_divergence = False
-        if len(active_pivots) >= 3 and a_p1["index"] < idx_5m:
-            a_p3 = active_pivots[2]
-            if a_p3["type"] == a_p1["type"]:
-                rsi1 = rsis_5m[a_p3["index"]]
-                rsi2 = rsis_5m[a_p1["index"]]
-                pr1, pr2 = a_p3["price"], a_p1["price"]
-                if (is_bullish and pr2 > pr1 and rsi2 < rsi1) or \
-                   (not is_bullish and pr2 < pr1 and rsi2 > rsi1):
-                    rsi_prev = rsi1
-                    div_price_gap = abs(pr2 - pr1) / pr1 * 100
-                    has_divergence = True
-
         prev_5m_idx = max(0, idx_5m - 1)
+
+        # RSI 다이버전스 (algorithm.calc_rsi_divergence — last wave 내부 모멘텀 천장 방식).
+        # 2026-08-03 수정: a_p1이 지금 형성 중인 봉(아직 마감 전)이면, "직전 마감봉"으로
+        # 클램프하는 게 아니라 그 이전에 확정돼 있던 진짜 극점 캔들로 되돌아간다. 저점/고점이
+        # 실제로 갱신되기 전까지는 참조 RSI가 바뀌면 안 된다 — 시간이 흘러 마감봉이 하나 더
+        # 생겼다는 이유만으로 참조 지점을 옮기면(구 버그) 파동 내내 값이 매 5분 계속
+        # 표류하는 결과가 됨(실측 78% 행에서 stale 값 확인).
+        if a_p1["index"] == idx_5m:
+            if p1_idx + 1 <= idx_5m - 1:
+                if extreme_type == "high":
+                    div_end_idx = memo_max_h_idx if memo_max_h >= p1["price"] else p1_idx
+                else:
+                    div_end_idx = memo_min_l_idx if memo_min_l <= p1["price"] else p1_idx
+            else:
+                div_end_idx = p1_idx
+        else:
+            div_end_idx = a_p1["index"]
+
+        div_pair_key = (a_p2["index"], div_end_idx)
+        if div_pair_key != div_key:
+            div_key = div_pair_key
+            div_result = calc_rsi_divergence(
+                rsis_5m, highs_5m, lows_5m,
+                a_p2["index"], div_end_idx, is_bullish,
+            )
+        div_rsi_gap, div_dist_bars, div_ref_price = div_result
+        dist_from_div_peak_to_end = div_dist_bars * 5 / (60 * 24)   # 봉 → 일 (wave_duration_day와 동일 단위)
+        div_price_gap = (abs(end_price - div_ref_price) / div_ref_price * 100
+                         if div_ref_price > 0 else 0.0)
 
         # 🚨 볼륨 상대강도 (버그 수정): 파동 끝 피봇 캔들 볼륨의 트레일링 500캔들 백분위.
         # 피봇이 현재 forming 캔들이면 직전 마감 캔들로 클램프하여 인과성 보장.
@@ -379,8 +407,7 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
             1 if is_bullish else 0,
             start_price, end_price,
             wave_scale, wave_duration_day,
-            1 if has_divergence else 0,
-            rsi_prev, div_price_gap,
+            div_rsi_gap, dist_from_div_peak_to_end, div_price_gap,
             vol_strength, vol_ratio_arr[prev_5m_idx],
             adx_5m_arr[prev_5m_idx], atr_5m_arr[prev_5m_idx],
             fib_pos, 1 if wave_filter_hit else 0,

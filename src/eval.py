@@ -43,12 +43,20 @@ MAX_TOP1_SHARE = 0.30          # 합격 기준 ②
 NEAR_LIQUIDATION_THRESHOLD = -95.0  # 증거금(100) 거의 다 날린 거래 판정 기준 (관측 전용, 학습/점수 미반영)
 
 
-def cache_path_for(symbol, suffix=""):
-    # 2026-08-03: v9bx — RSI-다이버전스 버그 2종만 수정(algorithm.py/prep_features.py,
-    # RSI-div-개편이전-핵심결함.md). 스키마·관측 차원은 v9b와 동일이라 체크포인트 자체는
-    # 호환되지만, 학습/평가에 쓰이는 데이터가 달라지므로 반드시 이 경로로 전환해야 함.
-    # 구 v9b 캐시는 구 체크포인트 재현/비교용으로 보존.
-    return os.path.join(CACHE_DIR, f"features_v9bx_{symbol}{suffix}.npy")
+# 🚨 2026-08-03 사고 기록: cache_path_for가 심볼명만 받고 캐시 버전을 하드코딩하던 구조라,
+# CACHE_VER를 v9bx→v9c로 올릴 때 v9bx로 학습된 구 체크포인트(0803-0053)를 eval.py로 재평가하면
+# "관측 차원은 동일(22)해서 에러 없이 로드되지만 필드 의미가 전혀 다른" 캐시를 조용히 먹여
+# v9_kpi가 +1.03(학습중 기록)에서 -0.75(재평가)로 완전히 틀어지는 사고가 실제로 발생했다
+# (원인 규명: 두 코드 버전 재구성 후 v9bx 캐시로 재평가 → +1.0345로 정확히 재현 확인).
+# 재발 방지책 두 가지: ① 버전을 명시적으로 고를 수 있는 --cache-ver CLI 옵션 추가(기본값은
+# 항상 최신 CACHE_VER — 신규 학습/평가엔 그대로 동작). ② env.py에 스키마 검증 가드 추가 —
+# 캐시 필드가 요구 스키마와 다르면 이제 조용히 넘어가지 않고 즉시 에러를 던진다.
+CACHE_VER = "v9c"  # prep_features.CACHE_VER와 반드시 동기화할 것
+
+
+def cache_path_for(symbol, suffix="", cache_ver=None):
+    cache_ver = cache_ver or CACHE_VER
+    return os.path.join(CACHE_DIR, f"features_{cache_ver}_{symbol}{suffix}.npy")
 
 
 def split_bounds(cache_paths, final=False):
@@ -466,8 +474,8 @@ def fmt_compound(cm):
 
 def evaluate(model, symbols, split, fee_rate=0.0005, decision_stride=1,
              n_segments=1, cache_suffix="", verbose=True,
-             max_hold_bars=None, leverage=None, final_split=False):
-    paths = {s: cache_path_for(s, cache_suffix) for s in symbols}
+             max_hold_bars=None, leverage=None, final_split=False, cache_ver=None):
+    paths = {s: cache_path_for(s, cache_suffix, cache_ver=cache_ver) for s in symbols}
     bounds = split_bounds(list(paths.values()), final=final_split)
     report = {"split": split, "fee_rate": fee_rate, "symbols": {}}
     all_trades = []
@@ -531,6 +539,10 @@ def main():
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--segments", type=int, default=1)
     parser.add_argument("--cache-suffix", default="", help="스모크용 캐시 suffix (예: _recent120d)")
+    parser.add_argument("--cache-ver", default=None,
+                        help="캐시 스키마 버전 (예: v9bx, v9c). 미지정 시 최신(eval.CACHE_VER) 사용 — "
+                             "구 스키마로 학습된 체크포인트를 재평가할 땐 반드시 그 학습 당시 버전을 "
+                             "지정해야 함(2026-08-03 사고: 미지정 시 최신 캐시로 조용히 잘못 평가됨)")
     parser.add_argument("--leverage", type=float, default=None,
                         help="고정 레버리지. 학습 때 --leverage를 지정했다면 반드시 동일 값 지정 "
                              "(liq_dist 관측 피처가 leverage에 의존하므로 불일치 시 평가가 왜곡됨)")
@@ -552,7 +564,7 @@ def main():
     report = evaluate(model, args.symbols, args.split, fee_rate=args.fee,
                       decision_stride=args.stride, n_segments=args.segments,
                       cache_suffix=args.cache_suffix, leverage=args.leverage,
-                      final_split=args.final_split)
+                      final_split=args.final_split, cache_ver=args.cache_ver)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2, ensure_ascii=False, default=str)

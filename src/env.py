@@ -44,7 +44,13 @@ ACT_HOLD, ACT_ENTER, ACT_CLOSE = 0, 1, 2
 NORM = {
     "wave_scale_max": 12.0,       # % (전체 기간 분포 리포트 기준 BTC/ETH p99 ≈ 10.5~10.7 커버)
     "duration_log_max": np.log1p(10.0),   # 일
-    "div_gap_max": 5.0,           # %
+    # RSI 다이버전스 (2026-08-03 재설계, last wave 내부 참조로 변경 — RSI-div-개편이전-핵심결함.md).
+    # 둘 다 v9c 풀 캐시 분포 리포트 실측(BTC/ETH p99)으로 확정. 07-25 B그룹 교훈(클립을 조이면
+    # 극단 구간 해상도를 잃어 MSL=-100 급증)에 따라 p99 대비 여유를 두는 쪽 선택.
+    "div_rsi_gap_max": 30.0,      # RSI 포인트. p99 실측(2026-08-03 div_end_idx 버그 수정 후):
+                                   # BTC 19.8 / ETH 23.0 → 상한 30.0 계속 커버
+    "div_gap_max": 3.5,           # % — div_price_gap(RSI 극점 이후 추가 가격이동 폭).
+                                   # p99 실측(버그 수정 후): BTC 1.00 / ETH 2.50 → 상한 3.5 계속 커버
     "vol_ratio_log_max": np.log1p(6.0),
     "atr_pct_max": 3.0,           # atr/close %
     "hold_log_max": np.log1p(43200.0),       # 분 (30일, rl 모드 포지션 보유시간 정규화 전용)
@@ -58,6 +64,18 @@ NORM = {
 }
 
 DEFAULT_MAX_HOLD_BARS = 10080  # 7일 (사전계산 안전을 위한 구현상 상한. 2026-07-16: 30일→7일, 파동 지속시간 분포(BTC p99≈5.4일)에 맞춤)
+
+# 🚨 2026-08-03 사고 방지 가드. _build_static_obs가 읽는 필드 전체 목록 — 캐시 스키마가
+# 바뀌었는데(예: v9bx→v9c, has_rsi_divergence 등 → div_rsi_gap 등) 구 스키마 캐시를 실수로
+# 물리면, 관측 차원이 같아 에러 없이 로드되고 필드 의미만 완전히 달라진 채 조용히 학습/평가가
+# 진행되는 사고가 실제로 있었음(eval.py 재로드 시 v9_kpi가 +1.03→-0.75로 틀어짐, 원인 규명 후
+# 재현 확인). 캐시 로드 시점에 필드 존재를 검증해 이런 경우 즉시(조용한 오염 대신) 에러를 낸다.
+REQUIRED_CACHE_FIELDS = (
+    "high", "low", "close", "ts_1m", "is_bullish", "start_price", "end_price", "atr_5m",
+    "wave_scale_percent", "wave_duration_day", "div_rsi_gap", "dist_from_div_peak_to_end",
+    "div_price_gap", "volatility_ratio", "relative_volume_strength", "adx_5m", "fib_pos",
+    "pre_hit_0382", "wave_age_min", "rsi_now", "ret_5m", "ret_15m", "ret_1h",
+)
 
 
 class TradingEnvV9(gym.Env):
@@ -80,6 +98,13 @@ class TradingEnvV9(gym.Env):
         super().__init__()
 
         data = np.load(cache_path)
+        missing = [f for f in REQUIRED_CACHE_FIELDS if f not in data.dtype.names]
+        if missing:
+            raise ValueError(
+                f"캐시 스키마 불일치: {cache_path}에 필드 {missing}가 없음. "
+                f"이 코드가 기대하는 스키마와 다른 버전의 캐시입니다 — "
+                f"env.py/eval.py의 cache_path_for(cache_ver=...)로 올바른 버전을 지정하세요."
+            )
         self.cache_path = cache_path
         n = len(data)
         self.lo = 0 if start_idx is None else max(0, int(start_idx))
@@ -134,12 +159,16 @@ class TradingEnvV9(gym.Env):
 
         ws = np.clip(data["wave_scale_percent"], 0, NORM["wave_scale_max"]) / NORM["wave_scale_max"]
         dur = np.log1p(np.clip(data["wave_duration_day"], 0, 10.0)) / NORM["duration_log_max"]
-        has_div = data["has_rsi_divergence"].astype(np.float64)     # 다이버전스 발생 여부 (0/1)
-        rsi = data["rsi_previous"].astype(np.float64)
-        # rsi_adj/gap은 has_div=0이면 캐시 단계에서 이미 각각 50.0/0.0(중립값)으로 고정되므로
-        # has_div=0 → rsi_adj=0.5, gap=0.0가 항상 성립 — 별도 마스킹 불필요, has_div가 그 신호를 명시.
-        rsi_adj = np.where(is_bull > 0, rsi, 100.0 - rsi) / 100.0   # 방향 조정 RSI (simulate_numba :139)
-        gap = np.clip(data["divergence_price_gap_percent"], 0, NORM["div_gap_max"]) / NORM["div_gap_max"]
+        # --- RSI 다이버전스 3종 (2026-08-03 재설계, algorithm.calc_rsi_divergence 참고) ---
+        # 구 (has_div 0/1 + 방향조정 rsi_previous + 가격갭)을 대체. 발생/미발생 플래그가 없어
+        # 센티넬(rsi_previous=50.0)과 불연속이 사라졌고, 셋 다 상시 유효한 연속값이라 마스킹 불필요.
+        # 세 값이 서로 직교하는 축을 담당: 모멘텀 크기 / 타이밍 / 가격.
+        # rsi_previous를 뺀 이유 — 파동 끝 RSI는 대부분 rsi_now와 같은 값이라
+        # (rsi_now, div_rsi_gap)에서 복원 가능해 한 칸이 순수 중복이었음.
+        div_rsi_gap = np.clip(data["div_rsi_gap"], 0, NORM["div_rsi_gap_max"]) / NORM["div_rsi_gap_max"]
+        # 파동 내부의 한 지점까지의 거리라 항상 wave_duration_day 이하 — 같은 단위/같은 정규화 사용
+        div_dist = np.log1p(np.clip(data["dist_from_div_peak_to_end"], 0, 10.0)) / NORM["duration_log_max"]
+        gap = np.clip(data["div_price_gap"], 0, NORM["div_gap_max"]) / NORM["div_gap_max"]
         vr = np.log1p(np.clip(data["volatility_ratio"], 0, 6.0)) / NORM["vol_ratio_log_max"]
         vs = np.clip(data["relative_volume_strength"], 0, 1)
         adx = np.clip(data["adx_5m"], 0, 100) / 100.0
@@ -161,8 +190,8 @@ class TradingEnvV9(gym.Env):
         d15 = np.clip(np.where(age_min >= 15, d15, 0.0), -1.0, 1.0)
 
         # --- 타이밍 피처 4종 (2026-07-20, v9b 캐시 필수) ---
-        # 현재 RSI: rsi_adj(다이버전스용 rsi_previous)와 동일한 방향조정 관례 —
-        # 파동 방향 기준 "과열 정도"로 통일해 롱/숏 대칭 학습
+        # 현재 RSI: 파동 방향 기준 "과열 정도"로 방향조정해 롱/숏 대칭 학습
+        # (2026-08-03 다이버전스 재설계 이후, 관측에 들어가는 RSI 절대수준은 이 칸이 유일)
         rsi_now_adj = np.where(is_bull > 0, data["rsi_now"], 100.0 - data["rsi_now"]) / 100.0
         # 트레일링 수익률: %를 그 시점 ATR%로 나눈 "몇 ATR 움직임"으로 정규화 후 클립
         atr_pct_raw = np.maximum(data["atr_5m"] / close * 100.0, 1e-4)
@@ -171,7 +200,7 @@ class TradingEnvV9(gym.Env):
         r1h = np.clip(data["ret_1h"] * 100.0 / atr_pct_raw, -NORM["ret1h_atr_clip"], NORM["ret1h_atr_clip"]) / NORM["ret1h_atr_clip"]
 
         return np.stack(
-            [ws, dur, has_div, rsi_adj, gap, vr, vs, adx, atr_pct, bull, fib, prehit, d5, d15,
+            [ws, dur, div_rsi_gap, div_dist, gap, vr, vs, adx, atr_pct, bull, fib, prehit, d5, d15,
              rsi_now_adj, r5, r15, r1h],
             axis=1,
         ).astype(np.float32)
