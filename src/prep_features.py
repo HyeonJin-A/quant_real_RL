@@ -48,10 +48,18 @@ PIVOT_PARAMS = {
     "XRP-USDT-SWAP": {"n": 4, "min_diff": 0.04},
 }
 PRE_HIT_LEVEL = 0.382
-VOL_STRENGTH_PERIOD = 500
 WARMUP_5M = 200
 
-CACHE_VER = "v9d2"  # 2026-08-04: div_rsi_gap/dist_from_div_peak_to_end/rsi_now를 5분봉
+CACHE_VER = "v9d3"  # 2026-08-04: adx_5m/atr_5m/volatility_ratio/relative_volume_strength를
+                    # df_5m(5분봉 DataFrame) 계산 대신 *_1m.csv의 5m_adx/5m_atr/5m_vol_ratio/
+                    # 5m_vol_str 컬럼(전부 롤링/시프트 기반 인과적, 매분 갱신 — 직접 재구성해
+                    # 상관계수 0.98~1.0으로 검증)으로 재계산. adx_5m/atr_5m/volatility_ratio는
+                    # "지금"(i) 그대로 라이브 조회, relative_volume_strength는 a_p1_idx1m
+                    # (B단계, 형성 중이면 라이브)에 인덱싱 — 기존 vol_idx=min(a_p1_idx,
+                    # prev_5m_idx) 클램프 불필요(1분 배열이라 항상 인과적). calculate_adx/
+                    # rolling_volume_strength(prep_features.py) 삭제(미사용).
+                    #
+                    # v9d2 (2026-08-04): div_rsi_gap/dist_from_div_peak_to_end/rsi_now를 5분봉
                     # RSI(df_5m["rsi"]) 대신 *_1m.csv의 5m_rsi 컬럼(1분 종가 기준 period-70
                     # RSI, 인과적 — Wilder RSI 재계산으로 검증됨)으로 재계산. 탐색 구간
                     # [a_p2, a_p1]을 rsi_1m_arr에서 직접 슬라이스해 argmax/argmin(기존
@@ -103,10 +111,10 @@ DTYPE_V9 = [
     ("div_rsi_gap", "f4"),                   # 파동 내 RSI 극값 − 파동 끝 RSI (>=0). 0이면 확인(confirmation)
     ("dist_from_div_peak_to_end", "f4"),     # RSI 극점 → 파동 끝 (일 단위, wave_duration_day와 동일 단위/정규화)
     ("div_price_gap", "f4"),                 # RSI 극점 이후 가격이 추가로 이동한 폭 (%)
-    ("relative_volume_strength", "f4"),      # 🚨 V8에서 0.0 하드코딩이던 버그 수정
-    ("volatility_ratio", "f4"),
-    ("adx_5m", "f4"),                        # 직전 마감 5m 캔들 기준
-    ("atr_5m", "f4"),                        # 직전 마감 5m 캔들 기준 (RMA)
+    ("relative_volume_strength", "f4"),      # 5m_vol_str(1분 컬럼), a_p1 피봇 위치 기준(형성 중이면 라이브)
+    ("volatility_ratio", "f4"),              # 5m_vol_ratio(1분 컬럼), 2026-08-04부터 매분 라이브
+    ("adx_5m", "f4"),                        # 5m_adx(1분 컬럼), 2026-08-04부터 매분 라이브
+    ("atr_5m", "f4"),                        # 5m_atr(1분 컬럼), 2026-08-04부터 매분 라이브
     ("fib_pos", "f4"),                       # (close-end)/(start-end): 0=파동끝, 1=파동시작
     ("pre_hit_0382", "i1"),
     ("wave_age_min", "f4"),
@@ -125,46 +133,6 @@ REPORT_FIELDS = [
     "volatility_ratio", "adx_5m", "fib_pos", "wave_age_min",
     "rsi_now", "ret_5m", "ret_15m", "ret_1h",
 ]
-
-
-def calculate_adx(df, period=14):
-    """backtest_v8.calculate_adx와 동일한 RMA 방식 (V8 백테스트가 그라운드 트루스)"""
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    up = high - high.shift(1)
-    down = low.shift(1) - low
-    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
-    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-
-    def rma(series, window):
-        alpha = 1 / window
-        return pd.Series(series).ewm(alpha=alpha, adjust=False).mean()
-
-    atr = rma(tr, period)
-    plus_di = 100 * rma(plus_dm, period) / atr
-    minus_di = 100 * rma(minus_dm, period) / atr
-    dx = (plus_di - minus_di).abs() / (plus_di + minus_di) * 100
-    adx = rma(dx, period)
-    return adx.fillna(0.0).values, atr.fillna(0.0).values
-
-
-def rolling_volume_strength(volumes, period=VOL_STRENGTH_PERIOD):
-    """
-    각 5m 캔들 볼륨의, 자기 시점까지의 트레일링 period개 윈도우 내 min-max 백분위.
-    Algorithm.get_relative_volume_strength(내림차순 df, iloc[idx:idx+period])와 동일 정의를
-    오름차순 배열에 벡터화한 것. 전부 과거 데이터만 사용하므로 인과적.
-    """
-    s = pd.Series(volumes)
-    roll_min = s.rolling(period, min_periods=1).min().values
-    roll_max = s.rolling(period, min_periods=1).max().values
-    denom = roll_max - roll_min
-    strength = np.where(denom > 0, (volumes - roll_min) / np.where(denom == 0, 1, denom), 0.0)
-    return np.clip(strength, 0.0, 1.0)
 
 
 def load_symbol(symbol, recent_days=None):
@@ -200,14 +168,13 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
     total_1m = len(df_1m)
     print(f"5m rows: {total_5m:,} / 1m rows: {total_1m:,}")
 
-    # --- 5m 사전계산 (전부 인과적 지표) ---
-    adx_5m_arr, atr_5m_arr = calculate_adx(df_5m, 14)
-
-    candle_range = df_5m["high"] - df_5m["low"]
-    ambient_vol = candle_range.shift(1).rolling(10).mean()
-    vol_ratio_arr = np.where(ambient_vol > 0, candle_range / ambient_vol, 1.0)
-
-    vol_strength_arr = rolling_volume_strength(df_5m["volume"].values)
+    # adx_5m/atr_5m/volatility_ratio/relative_volume_strength(2026-08-04 C단계):
+    # *_1m.csv의 5m_adx/5m_atr/5m_vol_ratio/5m_vol_str 컬럼(전부 롤링/시프트 기반 인과적
+    # 구성, 매분 갱신) 사용 — 5분봉 DataFrame(df_5m) 기반 계산 완전 제거.
+    adx_1m_arr = df_1m["5m_adx"].fillna(0.0).values
+    atr_1m_arr = df_1m["5m_atr"].fillna(0.0).values
+    vol_ratio_1m_arr = df_1m["5m_vol_ratio"].fillna(1.0).values   # 기존 폴백값(1.0) 유지
+    vol_str_1m_arr = df_1m["5m_vol_str"].fillna(0.0).values
 
     highs_5m = df_5m["high"].values
     lows_5m = df_5m["low"].values
@@ -416,8 +383,6 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
                       else ts_5m_low_precise_ms[a_p2["index"]])
         wave_duration_day = max(0.001, (a_p1_ts_ms - a_p2_ts_ms) / 86_400_000)
 
-        prev_5m_idx = max(0, idx_5m - 1)
-
         # wave age + RSI 다이버전스 탐색 시작점(2026-08-04 B단계): 파동 시작점(start_price)이
         # 바뀌면 신규 파동으로 간주 — a_p2 자신이 실제로 찍힌 정밀 1분 행을 정적 배열에서
         # 바로 조회해 탐색 시작점으로 고정한다(확정 지연 구간도 이미 배열에 존재하므로
@@ -457,10 +422,11 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
         div_price_gap = (abs(end_price - div_ref_price) / div_ref_price * 100
                          if div_ref_price > 0 else 0.0)
 
-        # 🚨 볼륨 상대강도 (버그 수정): 파동 끝 피봇 캔들 볼륨의 트레일링 500캔들 백분위.
-        # 피봇이 현재 forming 캔들이면 직전 마감 캔들로 클램프하여 인과성 보장.
-        vol_idx = min(a_p1["index"], prev_5m_idx)
-        vol_strength = vol_strength_arr[vol_idx]
+        # 볼륨 상대강도(2026-08-04 C단계): 파동 끝 피봇 캔들(a_p1) 볼륨의 트레일링
+        # 500(5분봉 환산)캔들 백분위. a_p1_idx1m(B단계, 형성 중이면 라이브)에 그대로
+        # 인덱싱 — 5m_vol_str이 1분 인과적 배열이라 예전처럼 "직전 마감봉"으로 클램프할
+        # 필요가 없어짐(클램프 제거가 오히려 더 정확함: 형성 중에도 정밀 시각 조회).
+        vol_strength = vol_str_1m_arr[a_p1_idx1m]
 
         # pre-hit 0.382 추적 (파동 start/end가 바뀌면 리셋 — simulate_numba와 동일)
         if start_price != prev_start or end_price != prev_end:
@@ -492,8 +458,8 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
             start_price, end_price,
             wave_scale, wave_duration_day,
             div_rsi_gap, dist_from_div_peak_to_end, div_price_gap,
-            vol_strength, vol_ratio_arr[prev_5m_idx],
-            adx_5m_arr[prev_5m_idx], atr_5m_arr[prev_5m_idx],
+            vol_strength, vol_ratio_1m_arr[i],
+            adx_1m_arr[i], atr_1m_arr[i],
             fib_pos, 1 if wave_filter_hit else 0,
             wave_age_min,
             rsi_now,   # 5m_rsi(1분 컬럼) 현재값 — 2026-08-04부터 매분 라이브
