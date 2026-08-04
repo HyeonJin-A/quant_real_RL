@@ -29,7 +29,7 @@ SRC_DIR = os.path.abspath(os.path.dirname(__file__))
 ROOT_DIR = os.path.abspath(os.path.join(SRC_DIR, ".."))
 sys.path.insert(0, SRC_DIR)
 
-from algorithm import find_dynamic_pivots, calc_rsi_divergence  # noqa: E402  (파동 감지 엔진은 V8과 동일한 것을 사용)
+from algorithm import find_dynamic_pivots  # noqa: E402  (파동 감지 엔진은 V8과 동일한 것을 사용)
 
 DATA_DIR = os.path.join(ROOT_DIR, "data", "candle_data")
 CACHE_DIR = os.path.join(ROOT_DIR, "caches")
@@ -51,7 +51,18 @@ PRE_HIT_LEVEL = 0.382
 VOL_STRENGTH_PERIOD = 500
 WARMUP_5M = 200
 
-CACHE_VER = "v9d1"  # 2026-08-04: wave_duration_day를 5분봉 인덱스 개수차×5분 대신
+CACHE_VER = "v9d2"  # 2026-08-04: div_rsi_gap/dist_from_div_peak_to_end/rsi_now를 5분봉
+                    # RSI(df_5m["rsi"]) 대신 *_1m.csv의 5m_rsi 컬럼(1분 종가 기준 period-70
+                    # RSI, 인과적 — Wilder RSI 재계산으로 검증됨)으로 재계산. 탐색 구간
+                    # [a_p2, a_p1]을 rsi_1m_arr에서 직접 슬라이스해 argmax/argmin(기존
+                    # calc_rsi_divergence와 동일 정의) — 끝점(a_p1)은 wave_duration_day와
+                    # 똑같이 "형성 중이면 라이브, 고정되면 a_p1의 정밀 시각"으로 판정해
+                    # div_price_gap(end_price=a_p1["price"])과 항상 같은 시점을 봄.
+                    # a_p1/a_p2의 인덱스 표현(5분봉)은 안 바꿔서 피봇 검출/vol_idx/memo_key/
+                    # ADX·ATR·volatility_ratio는 전부 무관·무변경. rsis_5m 의존 제거,
+                    # calc_rsi_divergence(algorithm.py) 삭제(미사용).
+                    #
+                    # v9d1 (2026-08-04): wave_duration_day를 5분봉 인덱스 개수차×5분 대신
                     # 실제 극값 발생 시각(타임스탬프) 차로 재계산 — 파동이 형성 중인
                     # 5분봉 안에서도 매분 정확히 갱신됨(기존엔 5분에 한 번씩만 바뀜).
                     # a_p1/a_p2의 인덱스 표현(5분봉)은 안 바꿔서 RSI 다이버전스/
@@ -101,7 +112,7 @@ DTYPE_V9 = [
     ("wave_age_min", "f4"),
     # --- 2026-07-20 타이밍 피처 (승률 천장 ~27%의 원인이 "전환 시점 판정 정보 부재"라는
     # 진단에 따른 추가 — 60d 런 칼손절 즉사 분석 참고). 전부 과거 데이터만 사용(인과적). ---
-    ("rsi_now", "f4"),                       # 직전 마감 5m 캔들의 RSI ("지금 과매수/과매도인가")
+    ("rsi_now", "f4"),                       # 5m_rsi(1분 컬럼) 현재값 ("지금 과매수/과매도인가", 2026-08-04부터 매분 라이브)
     ("ret_5m", "f4"),                        # close(t)/close(t-5분) - 1  (1m 종가 기준 트레일링 수익률)
     ("ret_15m", "f4"),                       # close(t)/close(t-15분) - 1
     ("ret_1h", "f4"),                        # close(t)/close(t-60분) - 1
@@ -198,10 +209,6 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
 
     vol_strength_arr = rolling_volume_strength(df_5m["volume"].values)
 
-    if "rsi" not in df_5m.columns:
-        df_5m["rsi"] = 50.0
-    rsis_5m = df_5m["rsi"].fillna(50.0).values
-
     highs_5m = df_5m["high"].values
     lows_5m = df_5m["low"].values
     ts_5m_dt = df_5m["ts_dt"].values
@@ -223,18 +230,35 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
     # 뭉뚱그리면 "형성 중 → 마감" 전환 순간 정밀 시각에서 캔들 시가로 정보가 깎여
     # wave_duration_day가 시간이 흘렀는데도 줄어드는 역전이 생긴다(실측 확인) — 그래서
     # 마감 여부와 무관하게 항상 같은 정밀도로 조회할 수 있도록 전 5분봉에 대해 1회만 계산.
+    # 2026-08-04 (B단계) 확장: 위 루프에서 이미 구하는 argmax/argmin 오프셋을 1분 행
+    # 인덱스로도 같이 저장 — RSI 다이버전스 탐색 구간의 시작/끝(a_p2/a_p1)을 rsi_1m_arr에
+    # 직접 인덱싱하기 위함. 값 자체(ts_5m_*_precise_ms)는 계산 경로만 바뀌었을 뿐 A 단계에서
+    # 이미 검증된 값과 완전히 동일 — 데이터 갭(e<=s) 폴백도 대응하는 1분 행이 없을 수 있어
+    # 캔들 시가 대신 가장 가까운 유효 행으로 클램프하도록 보강했다.
     m5_open_1m_idx = np.searchsorted(ts_1m_dt, ts_5m_dt)
     m5_close_1m_idx = np.append(m5_open_1m_idx[1:], total_1m)
     ts_5m_high_precise_ms = np.empty(total_5m, dtype=np.int64)
     ts_5m_low_precise_ms = np.empty(total_5m, dtype=np.int64)
+    ts_5m_high_precise_idx1m = np.empty(total_5m, dtype=np.int64)
+    ts_5m_low_precise_idx1m = np.empty(total_5m, dtype=np.int64)
     for k in range(total_5m):
         s, e = m5_open_1m_idx[k], m5_close_1m_idx[k]
         if e <= s:
-            ts_5m_high_precise_ms[k] = ts_5m_ms[k]
-            ts_5m_low_precise_ms[k] = ts_5m_ms[k]
+            fallback = min(max(s - 1, 0), total_1m - 1)
+            ts_5m_high_precise_idx1m[k] = fallback
+            ts_5m_low_precise_idx1m[k] = fallback
+            ts_5m_high_precise_ms[k] = ts_1m_ms[fallback]
+            ts_5m_low_precise_ms[k] = ts_1m_ms[fallback]
             continue
-        ts_5m_high_precise_ms[k] = ts_1m_ms[s + int(highs_1m[s:e].argmax())]
-        ts_5m_low_precise_ms[k] = ts_1m_ms[s + int(lows_1m[s:e].argmin())]
+        ts_5m_high_precise_idx1m[k] = s + int(highs_1m[s:e].argmax())
+        ts_5m_low_precise_idx1m[k] = s + int(lows_1m[s:e].argmin())
+        ts_5m_high_precise_ms[k] = ts_1m_ms[ts_5m_high_precise_idx1m[k]]
+        ts_5m_low_precise_ms[k] = ts_1m_ms[ts_5m_low_precise_idx1m[k]]
+
+    # RSI 다이버전스 3종(2026-08-04 B단계)용: 5분봉 RSI(rsis_5m) 대신 1분 컬럼 5m_rsi를
+    # 직접 사용 — period-70 RSI(1분 종가 기준, 5분×14=70과 동일 스케일), Wilder RSI
+    # 재계산으로 인과성(미래 데이터 미참조) 검증됨.
+    rsi_1m_arr = df_1m["5m_rsi"].fillna(50.0).values
 
     # --- 전역 피봇 (버그② 수정: 시간 오름차순 인과 검출) ---
     # 구버전은 내림차순 df에 검출기를 돌린 뒤 인덱스를 되돌렸다 — 대칭 N-Bar 판정을 역순에
@@ -250,8 +274,10 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
     pivot_ptr = 0
     forming_high = 0.0
     forming_high_ts_ms = 0
+    forming_high_idx1m = 0
     forming_low = 1e18
     forming_low_ts_ms = 0
+    forming_low_idx1m = 0
 
     # pre-hit / wave-age 추적 (simulate_numba :114-131과 동일 리셋 규칙)
     prev_start = -1.0
@@ -269,11 +295,13 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
     memo_max_h_idx = -1
     memo_min_l_idx = -1
 
-    # RSI 다이버전스 메모: (a_p2_idx, a_p1_idx)가 RSI 극점 탐색 구간을 완전히 결정하므로
-    # 이 조합이 바뀔 때만 argmax를 다시 돌린다 (조합은 5m 봉 마감 빈도로만 바뀜).
-    # 가격 갭은 파동 극점 가격(end_price)이 1m마다 갱신되므로 메모하지 않고 매 행 계산한다.
-    div_key = (-1, -1)
-    div_result = (0.0, 0, 0.0)
+    # RSI 다이버전스 탐색 구간 메모(2026-08-04 B단계): (a_p2_idx1m, a_p1_idx1m)가 탐색
+    # 구간을 완전히 결정하므로 이 조합이 바뀔 때만 argmax/argmin을 다시 돌린다.
+    a_p2_idx1m = -1
+    div_win_key = None
+    div_rsi_ref = 0.0
+    div_ref_price = 0.0
+    j_idx1m = 0
 
     rows = []
     t_loop = time.time()
@@ -287,8 +315,10 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
             idx_5m += 1
             forming_high = 0.0
             forming_high_ts_ms = 0
+            forming_high_idx1m = 0
             forming_low = 1e18
             forming_low_ts_ms = 0
+            forming_low_idx1m = 0
 
         if idx_5m < WARMUP_5M:
             continue
@@ -296,9 +326,11 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
         if highs_1m[i] > forming_high:
             forming_high = highs_1m[i]
             forming_high_ts_ms = ts_1m_ms[i]
+            forming_high_idx1m = i
         if lows_1m[i] < forming_low:
             forming_low = lows_1m[i]
             forming_low_ts_ms = ts_1m_ms[i]
+            forming_low_idx1m = i
 
         # 버그② 수정 (admission 가드): 구버전은 `index <= idx_5m - n`으로 거리 조건만 보고
         # 가격 조건(min_diff)을 빼먹어, 반등이 min_diff에 도달하기 전에 피봇을 확정 처리했다
@@ -386,32 +418,42 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
 
         prev_5m_idx = max(0, idx_5m - 1)
 
-        # RSI 다이버전스 (algorithm.calc_rsi_divergence — last wave 내부 모멘텀 천장 방식).
-        # 2026-08-03 수정: a_p1이 지금 형성 중인 봉(아직 마감 전)이면, "직전 마감봉"으로
-        # 클램프하는 게 아니라 그 이전에 확정돼 있던 진짜 극점 캔들로 되돌아간다. 저점/고점이
-        # 실제로 갱신되기 전까지는 참조 RSI가 바뀌면 안 된다 — 시간이 흘러 마감봉이 하나 더
-        # 생겼다는 이유만으로 참조 지점을 옮기면(구 버그) 파동 내내 값이 매 5분 계속
-        # 표류하는 결과가 됨(실측 78% 행에서 stale 값 확인).
-        if a_p1["index"] == idx_5m:
-            if p1_idx + 1 <= idx_5m - 1:
-                if extreme_type == "high":
-                    div_end_idx = memo_max_h_idx if memo_max_h >= p1["price"] else p1_idx
-                else:
-                    div_end_idx = memo_min_l_idx if memo_min_l <= p1["price"] else p1_idx
-            else:
-                div_end_idx = p1_idx
-        else:
-            div_end_idx = a_p1["index"]
+        # wave age + RSI 다이버전스 탐색 시작점(2026-08-04 B단계): 파동 시작점(start_price)이
+        # 바뀌면 신규 파동으로 간주 — a_p2 자신이 실제로 찍힌 정밀 1분 행을 정적 배열에서
+        # 바로 조회해 탐색 시작점으로 고정한다(확정 지연 구간도 이미 배열에 존재하므로
+        # 러닝 상태로 쌓을 필요 없음 — 자세한 이유는 V9 Design TODO 문서 B단계 참고).
+        if start_price != prev_wave_start:
+            prev_wave_start = start_price
+            wave_born_ms = ts_1m_ms[i]
+            a_p2_type = a_p2["type"]
+            a_p2_idx1m = (ts_5m_high_precise_idx1m[a_p2["index"]] if a_p2_type == "high"
+                          else ts_5m_low_precise_idx1m[a_p2["index"]])
+            div_win_key = None  # 아래에서 강제 재계산되도록
+        wave_age_min = (ts_1m_ms[i] - wave_born_ms) / 60000.0
 
-        div_pair_key = (a_p2["index"], div_end_idx)
-        if div_pair_key != div_key:
-            div_key = div_pair_key
-            div_result = calc_rsi_divergence(
-                rsis_5m, highs_5m, lows_5m,
-                a_p2["index"], div_end_idx, is_bullish,
-            )
-        div_rsi_gap, div_dist_bars, div_ref_price = div_result
-        dist_from_div_peak_to_end = div_dist_bars * 5 / (60 * 24)   # 봉 → 일 (wave_duration_day와 동일 단위)
+        # RSI 다이버전스 3종(2026-08-04 B단계, *_1m.csv의 5m_rsi 컬럼 기반 재설계):
+        # 탐색 구간 끝(a_p1)은 wave_duration_day와 동일한 형성/고정 분기 — 형성 중이면
+        # 라이브(forming_*_idx1m), 고정되면 a_p1의 정밀 1분 행. div_price_gap(end_price=
+        # a_p1["price"])과 항상 같은 시점을 보게 되어 세 필드 간 시점 분열이 없다.
+        if a_p1["index"] == idx_5m:
+            a_p1_idx1m = forming_high_idx1m if a_p1_type == "high" else forming_low_idx1m
+        else:
+            a_p1_idx1m = (ts_5m_high_precise_idx1m[a_p1["index"]] if a_p1_type == "high"
+                          else ts_5m_low_precise_idx1m[a_p1["index"]])
+
+        div_win_key_now = (a_p2_idx1m, a_p1_idx1m)
+        if div_win_key_now != div_win_key:
+            div_win_key = div_win_key_now
+            window = rsi_1m_arr[a_p2_idx1m: a_p1_idx1m + 1]
+            j_off = int(np.argmax(window) if is_bullish else np.argmin(window))
+            j_idx1m = a_p2_idx1m + j_off
+            div_rsi_ref = float(window[j_off])
+            div_ref_price = float(highs_1m[j_idx1m] if is_bullish else lows_1m[j_idx1m])
+
+        rsi_now = rsi_1m_arr[i]              # 관측값: 항상 라이브(파동과 무관)
+        rsi_end = rsi_1m_arr[a_p1_idx1m]     # 다이버전스 계산용: a_p1 위치(형성 중이면 라이브)에 고정
+        div_rsi_gap = max(0.0, (div_rsi_ref - rsi_end) if is_bullish else (rsi_end - div_rsi_ref))
+        dist_from_div_peak_to_end = max(0.001, (a_p1_ts_ms - ts_1m_ms[j_idx1m]) / 86_400_000)
         div_price_gap = (abs(end_price - div_ref_price) / div_ref_price * 100
                          if div_ref_price > 0 else 0.0)
 
@@ -435,12 +477,6 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
                 if lows_1m[i] <= target_price:
                     wave_filter_hit = True
 
-        # wave age: 파동 시작점(start_price)이 바뀌면 신규 파동으로 간주
-        if start_price != prev_wave_start:
-            prev_wave_start = start_price
-            wave_born_ms = ts_1m_ms[i]
-        wave_age_min = (ts_1m_ms[i] - wave_born_ms) / 60000.0
-
         denom = start_price - end_price
         fib_pos = (closes_1m[i] - end_price) / denom if denom != 0 else 0.0
 
@@ -460,7 +496,7 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
             adx_5m_arr[prev_5m_idx], atr_5m_arr[prev_5m_idx],
             fib_pos, 1 if wave_filter_hit else 0,
             wave_age_min,
-            rsis_5m[prev_5m_idx],   # 직전 마감 5m 캔들 RSI (adx/atr와 동일 시점 관례)
+            rsi_now,   # 5m_rsi(1분 컬럼) 현재값 — 2026-08-04부터 매분 라이브
             ret_5m, ret_15m, ret_1h,
         ))
 

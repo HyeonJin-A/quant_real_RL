@@ -51,9 +51,10 @@ NEAR_LIQUIDATION_THRESHOLD = -95.0  # 증거금(100) 거의 다 날린 거래 �
 # 재발 방지책 두 가지: ① 버전을 명시적으로 고를 수 있는 --cache-ver CLI 옵션 추가(기본값은
 # 항상 최신 CACHE_VER — 신규 학습/평가엔 그대로 동작). ② env.py에 스키마 검증 가드 추가 —
 # 캐시 필드가 요구 스키마와 다르면 이제 조용히 넘어가지 않고 즉시 에러를 던진다.
-CACHE_VER = "v9d1"  # prep_features.CACHE_VER와 반드시 동기화할 것 (2026-08-04: v9c->v9d1,
-                    # wave_duration_day 타임스탬프화). 구버전(v9c 등) 체크포인트 평가 시엔
-                    # --cache-ver로 명시할 것 — 안 하면 이 기본값(최신)을 조용히 먹는다.
+CACHE_VER = "v9d2"  # prep_features.CACHE_VER와 반드시 동기화할 것 (2026-08-04: v9d1->v9d2,
+                    # RSI 다이버전스 3종을 5m_rsi 1분 컬럼 기반으로 재계산). 구버전(v9c/v9d1 등)
+                    # 체크포인트 평가 시엔 --cache-ver로 명시할 것 — 안 하면 이 기본값(최신)을
+                    # 조용히 먹는다.
 
 
 def cache_path_for(symbol, suffix="", cache_ver=None):

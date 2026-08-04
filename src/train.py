@@ -330,7 +330,7 @@ def main():
                              "학습 때와 반드시 동일 값을 지정해야 함 — liq_dist 관측 피처가 leverage에 의존.")
     parser.add_argument("--cache-suffix", default="", help="스모크용 캐시 suffix (예: _recent120d)")
     parser.add_argument("--cache-ver", default=None,
-                         help="캐시 버전 (예: v9d1). 미지정 시 eval.CACHE_VER(최신) 사용 — "
+                         help="캐시 버전 (예: v9d2). 미지정 시 eval.CACHE_VER(최신) 사용 — "
                               "2026-08-04: train.py에 이 옵션이 없어 eval.py의 --cache-ver와 "
                               "달리 항상 eval.CACHE_VER 하드코딩 값만 쓰던 누락을 뒤늦게 발견해 추가")
     parser.add_argument("--dummy-vec", action=argparse.BooleanOptionalAction, default=True,
