@@ -1,7 +1,7 @@
 # V9 Design TODO — 5분봉 데이터 제거, 1분 단일 인덱스 아키텍처 전환
 
-상태: **A/B 단계 적용 완료 및 검증 통과 (2026-08-04, `CACHE_VER=v9d2`).** C는 미착수,
-5m 데이터 완전 제거(피봇 구조 개편)는 맨 마지막으로 이동.
+상태: **A/B/C 단계 적용 완료 및 검증 통과 (2026-08-04, `CACHE_VER=v9d3`).**
+5m 데이터 완전 제거(피봇 구조 개편)만 맨 마지막으로 남음.
 
 **A 단계 적용 결과 요약**: `src/prep_features.py` 3곳 수정(설계 결함 재점검 후 확정된
 버전, 3장 참고). 풀 캐시(BTC/ETH) 재생성 후 필드별 회귀 — `wave_duration_day` 딱 한
@@ -21,8 +21,19 @@ ETH는 342만 행 전부 통과, BTC는 345만 행 중 1행(2020-05-13 16:35 5�
 재생성 후 필드별 회귀(바뀐 필드 4개만, 나머지 비트 단위 동일), `a_p1` 정지 구간
 전부(BTC 323만행/ETH 330만행)에서 세 필드 동시 동결 확인(위반 0건), 확정 지연 구간
 누락 없음을 실제 파동 샘플로 확인. `distribution_report` p99(BTC 10.5pt/ETH 13.5pt)도
-`NORM["div_rsi_gap_max"]=30.0` 커버리지 이내라 `env.py` 변경 불필요. `design_spec.md`
-반영 완료.
+`NORM["div_rsi_gap_max"]=30.0` 커버리지 이내라 `env.py` 변경 불필요.
+
+**C 단계 적용 결과 요약**: `adx_5m`/`atr_5m`/`volatility_ratio`/`relative_volume_strength`를
+`*_1m.csv`의 `5m_adx`/`5m_atr`/`5m_vol_ratio`/`5m_vol_str`(1분 컬럼, 직접 재구성한 값과
+상관계수 0.98~1.0으로 인과성 검증됨) 기반으로 재설계. 앞의 3개는 "현재 시장 레짐"이라
+"지금"(`i`) 그대로 라이브 조회, `relative_volume_strength`만 성격이 달라(파동 끝 피봇
+캔들 자체의 값) B단계의 `a_p1_idx1m`을 재사용해 인덱싱 — 기존 `vol_idx` 클램프는
+불필요해져 제거(더 정확해짐). 풀 캐시(BTC/ETH) 재생성 후 필드별 회귀(바뀐 필드 4개만,
+나머지 비트 단위 동일), 같은 5분봉 그룹 내에서도 80~98% 행이 값이 갱신됨 확인(기존엔
+0%, 5분에 한 번만 바뀜), `relative_volume_strength` 범위 `[0,1]` 확인.
+`distribution_report` p99(`volatility_ratio` 3.6~3.8, `atr_close_percent` 0.58~0.84)도
+`NORM["vol_ratio_log_max"]`/`atr_pct_max` 커버리지 이내라 `env.py` 변경 불필요.
+`design_spec.md` 반영 완료.
 
 ## 1. 배경
 
@@ -168,9 +179,35 @@ A의 `forming_high`/`forming_low` 패턴을 그대로 이식해, 파동 시작(`
 30~214분짜리 실제 파동에서 탐색 시작점이 지연 구간을 포함함을 별도 스크립트로 확인.
 `CACHE_VER`: v9d1 → **v9d2**.
 
-## 5. C 단계 — `adx_5m`/`atr_5m`/`volatility_ratio`/`relative_volume_strength` (미착수, 독립적)
+## 5. C 단계 (적용 완료) — `adx_5m`/`atr_5m`/`volatility_ratio`/`relative_volume_strength`
 
-피봇과 무관 — A/B와 순서 상관없이 언제 적용해도 됨. 설계는 기존 그대로 유효:
+피봇과 무관 — A/B와 순서 상관없이 적용 가능했음. 애초 설계(아래 옛 초안)는 직접
+roll/shift로 재계산하는 방식이었으나, **사용자가 `*_1m.csv`에 `5m_adx`/`5m_atr`/
+`5m_vol_ratio`/`5m_vol_str` 4개 컬럼을 이미 미리 계산해 추가해둬** 직접 재구현할 필요가
+없어짐 — 그 컬럼들을 읽어 쓰는 것으로 스코프가 대폭 축소됨.
+
+인과성은 직접 재구성(`rolling(5)`+`shift(5)` 기반)해 상관계수로 검증: `5m_vol_ratio`
+0.999995, `5m_vol_str` 0.9999998, `5m_atr` 0.9999980(사실상 동일), `5m_adx` 0.9795
+(ADX가 비선형 재귀라 캔들 구성 디테일 차이가 누적됐을 가능성, 같은 인과적 계열로 판단).
+
+`adx_5m`/`atr_5m`/`volatility_ratio`는 "현재 시장 레짐"을 보는 필드라 원래도 "지금"을
+보고 싶었으나 5분봉이라 `prev_5m_idx`(직전 마감 5분봉)로 근사했던 것 — 1분 컬럼은 매분
+인과적이므로 `i`(지금) 그대로 조회. `relative_volume_strength`만 성격이 달라(파동 끝
+피봇 캔들 자체의 볼륨 백분위, "지금"이 아니라 **a_p1 위치**를 봐야 함) B단계에서 이미
+계산해 둔 `a_p1_idx1m`(형성 중이면 라이브, 고정되면 정밀 1분 행)에 그대로 인덱싱 — 1분
+배열은 항상 인과적이라 기존 `vol_idx = min(a_p1_idx, prev_5m_idx)` 클램프가 불필요해짐
+(제거가 오히려 더 정확 — 형성 중에도 정밀 조회 가능, A/B단계와 같은 개선 패턴).
+
+`prep_features.py`: `df_5m` 기반 계산 블록(`calculate_adx`/`candle_range`+`ambient_vol`/
+`rolling_volume_strength` 호출)을 4개 1분 배열 로드로 교체, `vol_idx`/`prev_5m_idx`
+삭제, `calculate_adx`/`rolling_volume_strength` 함수와 `VOL_STRENGTH_PERIOD` 상수 삭제
+(미사용, 외부 참조 없음 확인).
+
+**검증**: 풀 캐시(BTC/ETH) 필드별 회귀(바뀐 필드 4개만, 나머지 비트 단위 동일), 같은
+5분봉 그룹 내에서도 80~98% 행이 값이 갱신됨 확인(기존엔 0%), `relative_volume_strength`
+범위 `[0,1]` 확인. `CACHE_VER`: v9d2 → **v9d3**.
+
+### 옛 초안(참고용, 실제로는 위처럼 컬럼을 직접 읽는 것으로 대체됨)
 
 ```python
 high_roll = high_1m.rolling(5).max()
@@ -183,7 +220,6 @@ close_roll_prev = close_1m.shift(5)
   `ambient_vol = range_roll.shift(5).rolling(50, min_periods=1).mean()`.
 - `relative_volume_strength`: `vol_roll = volume_1m.rolling(5).sum()`; 기존
   `rolling_volume_strength`를 `period=2500`으로 적용.
-- 필드명 그대로 유지, 주석만 갱신.
 
 ## 6. 5m 데이터 완전 제거 (피봇 1분봉 재검출) — 맨 마지막, 착수 안 함
 
