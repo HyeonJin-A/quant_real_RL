@@ -51,7 +51,14 @@ PRE_HIT_LEVEL = 0.382
 VOL_STRENGTH_PERIOD = 500
 WARMUP_5M = 200
 
-CACHE_VER = "v9c"  # 2026-08-03: RSI 다이버전스 "last wave 외부 참조" 결함 수정
+CACHE_VER = "v9d1"  # 2026-08-04: wave_duration_day를 5분봉 인덱스 개수차×5분 대신
+                    # 실제 극값 발생 시각(타임스탬프) 차로 재계산 — 파동이 형성 중인
+                    # 5분봉 안에서도 매분 정확히 갱신됨(기존엔 5분에 한 번씩만 바뀜).
+                    # a_p1/a_p2의 인덱스 표현(5분봉)은 안 바꿔서 RSI 다이버전스/
+                    # relative_volume_strength/피봇 검출은 전부 무관·무변경. v9c와
+                    # wave_duration_day 값만 다르고 나머지 필드는 bit-identical.
+                    #
+                    # v9c (2026-08-03): RSI 다이버전스 "last wave 외부 참조" 결함 수정
                    # (RSI-div-개편이전-핵심결함.md) — v9bx(버그①②만 수정) 위에 적용.
                    # 구버전은 last wave 끝(a_p1)과 전전 파동 끝(a_p3)을 비교(파동 바깥 참조).
                    # a_p2~a_p1(last wave 내부)에서 RSI 극값을 찾아 파동 끝 RSI와 비교하는
@@ -209,6 +216,25 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
     # 초 단위로 저장됐고, ms를 가정하는 wave_age_min(→ d5/d15 관측 게이트 전멸),
     # trades_per_month(1000배), yearly_breakdown(1970년) 등이 연쇄로 깨졌었음.
     ts_1m_ms = (df_1m["ts_dt"].astype("datetime64[ns]").astype("int64") // 10**6).values
+    ts_5m_ms = (df_5m["ts_dt"].astype("datetime64[ns]").astype("int64") // 10**6).values
+
+    # wave_duration_day 타임스탬프화(2026-08-04)용 사전 계산: 각 5분봉의 고가/저가가
+    # 그 캔들 내 정확히 몇 분에 발생했는지 미리 찾아둔다. 5분봉 시가(ts_5m_ms)로
+    # 뭉뚱그리면 "형성 중 → 마감" 전환 순간 정밀 시각에서 캔들 시가로 정보가 깎여
+    # wave_duration_day가 시간이 흘렀는데도 줄어드는 역전이 생긴다(실측 확인) — 그래서
+    # 마감 여부와 무관하게 항상 같은 정밀도로 조회할 수 있도록 전 5분봉에 대해 1회만 계산.
+    m5_open_1m_idx = np.searchsorted(ts_1m_dt, ts_5m_dt)
+    m5_close_1m_idx = np.append(m5_open_1m_idx[1:], total_1m)
+    ts_5m_high_precise_ms = np.empty(total_5m, dtype=np.int64)
+    ts_5m_low_precise_ms = np.empty(total_5m, dtype=np.int64)
+    for k in range(total_5m):
+        s, e = m5_open_1m_idx[k], m5_close_1m_idx[k]
+        if e <= s:
+            ts_5m_high_precise_ms[k] = ts_5m_ms[k]
+            ts_5m_low_precise_ms[k] = ts_5m_ms[k]
+            continue
+        ts_5m_high_precise_ms[k] = ts_1m_ms[s + int(highs_1m[s:e].argmax())]
+        ts_5m_low_precise_ms[k] = ts_1m_ms[s + int(lows_1m[s:e].argmin())]
 
     # --- 전역 피봇 (버그② 수정: 시간 오름차순 인과 검출) ---
     # 구버전은 내림차순 df에 검출기를 돌린 뒤 인덱스를 되돌렸다 — 대칭 N-Bar 판정을 역순에
@@ -223,7 +249,9 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
     idx_5m = 0
     pivot_ptr = 0
     forming_high = 0.0
+    forming_high_ts_ms = 0
     forming_low = 1e18
+    forming_low_ts_ms = 0
 
     # pre-hit / wave-age 추적 (simulate_numba :114-131과 동일 리셋 규칙)
     prev_start = -1.0
@@ -258,15 +286,19 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
         while idx_5m + 1 < total_5m and cur_ts >= ts_5m_dt[idx_5m + 1]:
             idx_5m += 1
             forming_high = 0.0
+            forming_high_ts_ms = 0
             forming_low = 1e18
+            forming_low_ts_ms = 0
 
         if idx_5m < WARMUP_5M:
             continue
 
         if highs_1m[i] > forming_high:
             forming_high = highs_1m[i]
+            forming_high_ts_ms = ts_1m_ms[i]
         if lows_1m[i] < forming_low:
             forming_low = lows_1m[i]
+            forming_low_ts_ms = ts_1m_ms[i]
 
         # 버그② 수정 (admission 가드): 구버전은 `index <= idx_5m - n`으로 거리 조건만 보고
         # 가격 조건(min_diff)을 빼먹어, 반등이 min_diff에 도달하기 전에 피봇을 확정 처리했다
@@ -334,7 +366,23 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
         is_bullish = (a_p1["type"] == "high")
 
         wave_scale = abs(end_price - start_price) / start_price * 100
-        wave_duration_day = max(0.001, (a_p1["index"] - a_p2["index"]) * 5 / (60 * 24))
+
+        # wave_duration_day (2026-08-04 타임스탬프 기반 재설계, V9 Design TODO 문서 참고):
+        # 인덱스 개수차×5분 대신 실제 극값 발생 시각의 차를 쓴다 — a_p1/a_p2의 인덱스
+        # 표현(5분봉)은 전혀 안 바꾸므로 RSI 다이버전스/vol_idx/피봇 검출은 무관.
+        # a_p1이 형성 중(index==idx_5m)이면 그 극값이 실제로 갱신된 정밀 분(forming_*_ts_ms),
+        # 아니면 그 5분봉의 사전계산된 정밀 발생 시각(ts_5m_*_precise_ms) — 캔들이 마감돼
+        # 이 분기가 바뀌는 순간에도 두 값이 동일해 경계에서 값이 끊기지 않는다.
+        a_p1_type = a_p1["type"]
+        if a_p1["index"] == idx_5m:
+            a_p1_ts_ms = forming_high_ts_ms if a_p1_type == "high" else forming_low_ts_ms
+        else:
+            a_p1_ts_ms = (ts_5m_high_precise_ms[a_p1["index"]] if a_p1_type == "high"
+                          else ts_5m_low_precise_ms[a_p1["index"]])
+        a_p2_type = a_p2["type"]
+        a_p2_ts_ms = (ts_5m_high_precise_ms[a_p2["index"]] if a_p2_type == "high"
+                      else ts_5m_low_precise_ms[a_p2["index"]])
+        wave_duration_day = max(0.001, (a_p1_ts_ms - a_p2_ts_ms) / 86_400_000)
 
         prev_5m_idx = max(0, idx_5m - 1)
 

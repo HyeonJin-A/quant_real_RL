@@ -329,6 +329,10 @@ def main():
                              "청산 위험이 과도해 실전 배제로 결론나 5.0 채택, 5장·6장 참고). eval.py 평가 시 "
                              "학습 때와 반드시 동일 값을 지정해야 함 — liq_dist 관측 피처가 leverage에 의존.")
     parser.add_argument("--cache-suffix", default="", help="스모크용 캐시 suffix (예: _recent120d)")
+    parser.add_argument("--cache-ver", default=None,
+                         help="캐시 버전 (예: v9d1). 미지정 시 eval.CACHE_VER(최신) 사용 — "
+                              "2026-08-04: train.py에 이 옵션이 없어 eval.py의 --cache-ver와 "
+                              "달리 항상 eval.CACHE_VER 하드코딩 값만 쓰던 누락을 뒤늦게 발견해 추가")
     parser.add_argument("--dummy-vec", action=argparse.BooleanOptionalAction, default=True,
                         help="DummyVecEnv(단일 프로세스) 사용 — 2026-07-28부터 기본값. action masking 도입으로 "
                              "MaskablePPO가 매 스텝 env.step()과 별도로 action_masks()를 한 번 더 조회하면서 "
@@ -361,7 +365,7 @@ def main():
     os.makedirs(MODEL_DIR, exist_ok=True)
     os.makedirs(LOG_DIR, exist_ok=True)
 
-    cache_paths = {s: cache_path_for(s, args.cache_suffix) for s in args.symbols}
+    cache_paths = {s: cache_path_for(s, args.cache_suffix, cache_ver=args.cache_ver) for s in args.symbols}
     for s, p in cache_paths.items():
         if not os.path.exists(p):
             raise FileNotFoundError(f"cache not found for {s}: {p} — run prep_features_v9.py first")
