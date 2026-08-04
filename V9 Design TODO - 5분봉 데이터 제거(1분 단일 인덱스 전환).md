@@ -1,7 +1,8 @@
 # V9 Design TODO — 5분봉 데이터 제거, 1분 단일 인덱스 아키텍처 전환
 
-상태: **A/B/C 단계 적용 완료 및 검증 통과 (2026-08-04, `CACHE_VER=v9d3`).**
-5m 데이터 완전 제거(피봇 구조 개편)만 맨 마지막으로 남음.
+상태: **🎉 전 단계(A/B/C + 5m 데이터 완전 제거) 적용 완료 및 검증 통과 (2026-08-05,
+`CACHE_VER=v9d4`). 이 문서의 목표(1분 단일 인덱스 아키텍처 전환) 달성 — `prep_features.py`가
+`_1m.csv`만 읽음.**
 
 **A 단계 적용 결과 요약**: `src/prep_features.py` 3곳 수정(설계 결함 재점검 후 확정된
 버전, 3장 참고). 풀 캐시(BTC/ETH) 재생성 후 필드별 회귀 — `wave_duration_day` 딱 한
@@ -221,15 +222,61 @@ close_roll_prev = close_1m.shift(5)
 - `relative_volume_strength`: `vol_roll = volume_1m.rolling(5).sum()`; 기존
   `rolling_volume_strength`를 `period=2500`으로 적용.
 
-## 6. 5m 데이터 완전 제거 (피봇 1분봉 재검출) — 맨 마지막, 착수 안 함
+## 6. 5m 데이터 완전 제거 (피봇 1분봉 재검출) — 적용 완료 (2026-08-05)
 
-A/B/C 어느 것에도 더 이상 전제조건이 아님이 확인됨 — 순수하게 "이중 인덱스 구조 자체를
-없애고 싶다"는 코드 정리 목적일 때만 의미가 있는, 가장 크고 리스크 높은 변경. 필요성이
-분명해지기 전까지는 계획만 남겨두고 착수하지 않는다.
+A/B/C 어느 것에도 더 이상 전제조건이 아니었지만, "이중 인덱스 구조 자체를 없애고 싶다"는
+목적으로 최종 착수·완료. 가장 크고 리스크 높은 변경이었던 만큼 계획 단계에서 사용자가
+클램프 결함(아래)을 미리 지적해 구현 전에 수정.
 
-- `find_dynamic_pivots(df_1m, n=n_5m*5, min_diff=min_diff_5m)` — `min_diff`는 스케일
-  불변 그대로, `n`만 ×5(BTC 3→15, ETH 4→20).
+### 설계
+
+- `find_dynamic_pivots(df_1m, n=n, min_diff=min_diff)` — `min_diff`는 스케일 불변 그대로,
+  `n`은 `PIVOT_PARAMS`에 이미 ×5 반영된 1분봉 기준 값(BTC 3→15, ETH 4→20)을 그대로 사용
+  (2026-08-05 리팩터링: 최초엔 호출부에서 매번 `n*5`로 환산했는데, 상수 정의 시점에 미리
+  곱해두는 쪽으로 변경 — 결과값 동일, 캐시 재생성 불필요). `find_dynamic_pivots`
+  (algorithm.py) 자체는 캔들 단위 무관 범용 함수라 무수정.
 - 메인 루프의 `idx_5m`/`memo_key`/`forming_high`/`forming_low`를 `p1_idx` 변경시에만
-  리셋되는 `running_extreme_price`/`idx` 증분 추적으로 교체.
-- 이 변경은 피봇 SET 자체가 미세하게 달라질 수 있어(1분 단위 wick 가시성) 전 필드 재검증
-  필요 — 기존 5분봉 지그재그 대비 피봇 개수·가격·시각 차이 리포트로 확인 후 진행.
+  리셋되는 `running_extreme_price`/`idx` 증분 추적으로 교체 — 리셋 시 `p1_idx+1..현재`
+  구간을 1회 스캔해 시드(확정 지연 구간 포함, B단계에서 검증된 결함 패턴 재발 방지),
+  이후 매 행 O(1) 증분. 총 스캔량은 텔레스코핑 합이라 전체 O(total_1m).
+- 피봇 인덱스가 곧 1분 행 번호가 되어, A/B단계가 만든 "5분 인덱스 ↔ 1분 정밀 시각/인덱스"
+  변환 장치(`ts_5m_*_precise_ms`/`idx1m` 등)가 통째로 불필요해져 삭제 — `ts_1m_ms[a_p1["index"]]`처럼
+  직접 조회. `_5m.csv` 로딩 자체 제거(`load_symbol`이 `df_1m`만 반환).
+
+### 🚨 클램프 결함 (구현 전 사용자 지적, 계획 단계에서 수정)
+
+`running_extreme_price`를 클램프 없이 그대로 `extreme_price`에 쓰면, 확정 피봇(p1) 직후
+급격한 갭다운/갭업으로 이후 구간의 실제 극값이 `p1["price"]`를 역행할 때(예:
+`low=100` 확정 직후 그 뒤 모든 high가 100 미만) "low(100) 다음에 그보다 낮은
+high(90)"처럼 **파동 방향이 뒤집히는 구조 파괴**가 생긴다. 구코드는
+`max(p1["price"], memo_max_h, forming_high)`/`min(...)`으로 이 클램프를 암묵적으로
+하고 있었는데, 새 러닝 익스트림 설계 초안엔 이게 빠져있었음 — 사용 시점에 명시적으로
+재현해 수정:
+```python
+if extreme_type == "high":
+    extreme_price = max(p1["price"], running_extreme_price)
+    extreme_idx = running_extreme_idx if running_extreme_price > p1["price"] else p1_idx
+else:
+    extreme_price = min(p1["price"], running_extreme_price)
+    extreme_idx = running_extreme_idx if running_extreme_price < p1["price"] else p1_idx
+```
+
+### 검증 (A/B/C와 다른 방식 — 피봇 SET 자체가 달라지므로 비트 동일 검증 불가)
+
+1. **피봇 SET 비교**(`np.searchsorted` 벡터화 최근접 매칭 — 최초 나이브 Python 이중루프는
+   12분+ 걸려도 안 끝나 벡터화로 교체): BTC 30190↔29438개, ETH 15000↔14786개. 매칭된
+   피봇의 가격차 중앙값 0%(대부분 완전 일치), 시간차 중앙값 2분/p95 4분. 아웃라이어
+   (가격차>0.01%: BTC 7%/ETH 4%) 중 최악 사례(BTC 14.8% 가격차) 직접 조사 — **2021-09-07
+   BTC 플래시 크래시**에서 5분봉 버전은 짧은 반등을 저점(49700)으로 오판 확정했는데,
+   1분봉 버전은 그 반등이 n-거리 조건을 못 채워 계속 추적을 이어가 진짜 바닥(42322)까지
+   정확히 잡아냄 — 결함이 아니라 1분 정밀도의 정당한 이점으로 확인.
+2. **클램프 회귀 검증**: `is_bullish`와 `end_price`/`start_price` 대소관계 일치 어설션,
+   풀 데이터셋(BTC 345만/ETH 344만 행) 전부 위반 0건.
+3. 기존 인과성 검증(`dist_from_div_peak_to_end>=0.001`, `relative_volume_strength∈[0,1]`,
+   같은 파동 내 `wave_duration_day` 단조 비감소) 전부 위반 0건.
+4. `distribution_report`가 v9d3과 거의 동일한 스케일 — `NORM` 조정 불필요.
+   `env.py` 로드/스텝 스모크 통과. BTC 행수가 v9d3 대비 4행 적음(`WARMUP_5M`→`WARMUP_1M`
+   웜업 경계 정의 차이로 데이터 시작부 미세한 갭, 무해).
+
+`CACHE_VER`: v9d3 → **v9d4**(사용자 지정 — 피봇 검출 방식 자체가 바뀌는 질적 전환이지만 v9d 계열 번호로 유지).
+`design_spec.md` 반영 완료.

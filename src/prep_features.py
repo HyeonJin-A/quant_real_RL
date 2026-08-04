@@ -34,23 +34,54 @@ from algorithm import find_dynamic_pivots  # noqa: E402  (파동 감지 엔진�
 DATA_DIR = os.path.join(ROOT_DIR, "data", "candle_data")
 CACHE_DIR = os.path.join(ROOT_DIR, "caches")
 
-PIVOT_N = 8
+PIVOT_N = 40  # 2026-08-05: 1분봉 네이티브 검출로 전환되며 5분봉 기준 그리드서치 값(8)에 x5 — 아래 참고
 PIVOT_MIN_DIFF = 0.02
 # 2026-07-17: 심볼별 최적 (n, min_diff)를 src/param_search/pivot_edge_search로 별도 그리드서치해서 확정.
 # 목록에 없는 심볼은 위 PIVOT_N/PIVOT_MIN_DIFF(V8 기본값)로 폴백.
+# 2026-08-05: 그리드서치는 5분봉 기준으로 했으므로(n=5분봉 캔들 개수), 피봇 검출이 1분봉
+# 네이티브로 바뀐 지금은 n에 x5를 해서 저장 — 예전엔 호출부(find_dynamic_pivots)에서 매번
+# n*5로 환산했는데, 상수 정의 시점에 미리 곱해두는 쪽으로 변경(호출부는 이제 n을 그대로 씀).
+# min_diff는 가격 비율이라 스케일 불변, 그대로.
 PIVOT_PARAMS = {
-    "BTC-USDT-SWAP": {"n": 3, "min_diff": 0.0075},
-    "ETH-USDT-SWAP": {"n": 4, "min_diff": 0.015},
+    "BTC-USDT-SWAP": {"n": 15, "min_diff": 0.0075},   # 5분봉 그리드서치 원값 n=3 x5
+    "ETH-USDT-SWAP": {"n": 20, "min_diff": 0.015},    # 5분봉 그리드서치 원값 n=4 x5
     # 2026-07-23: SOL은 별도 그리드서치 없이 ETH와 동일값 사용 (사용자 지정)
-    "SOL-USDT-SWAP": {"n": 4, "min_diff": 0.015},
+    "SOL-USDT-SWAP": {"n": 20, "min_diff": 0.015},    # 5분봉 그리드서치 원값 n=4 x5
     # 2026-07-23: XRP는 아직 원본 데이터(data/candle_data/)가 없어 캐시는 미생성 — 나중에 데이터가
     # 준비되면 파라미터만 바로 쓸 수 있도록 등록만 해둠 (사용자 지정)
-    "XRP-USDT-SWAP": {"n": 4, "min_diff": 0.04},
+    "XRP-USDT-SWAP": {"n": 20, "min_diff": 0.04},     # 5분봉 그리드서치 원값 n=4 x5
 }
 PRE_HIT_LEVEL = 0.382
-WARMUP_5M = 200
+WARMUP_1M = 1000  # 2026-08-05: 피봇이 1분봉 네이티브가 되며 WARMUP_5M(200개=1000분)을
+                  # 같은 실제 시간폭의 1분 단위로 이름·값 변경(200*5=1000)
 
-CACHE_VER = "v9d3"  # 2026-08-04: adx_5m/atr_5m/volatility_ratio/relative_volume_strength를
+CACHE_VER = "v9d4"  # 2026-08-05: 5m 데이터 완전 제거 — 피봇(a_p1/a_p2) 검출 자체를 5분봉
+                    # (df_5m/_5m.csv) 대신 1분봉(df_1m)에서 직접 수행. find_dynamic_pivots는
+                    # 캔들 단위 무관 범용 함수라 무수정, 호출부는 df_1m/n(PIVOT_PARAMS에 이미
+                    # 1분봉 기준 x5로 저장 — 최초엔 호출부에서 매번 n*5로 환산했다가, 상수
+                    # 정의 시점에 미리 곱해두는 쪽으로 리팩터링. 결과값은 완전히 동일해 캐시
+                    # 재생성 불필요, CACHE_VER 그대로 v9d4 유지)/min_diff(스케일 불변, 그대로)
+                    # 로 교체. a_p1["index"]/a_p2["index"]가 이제 곧 1분 행
+                    # 번호가 되어, A/B단계가 만들었던 "5분 인덱스 ↔ 1분 정밀 시각/인덱스"
+                    # 변환 장치(ts_5m_high/low_precise_ms/idx1m, forming_*_ts_ms/idx1m,
+                    # memo_max_h/min_l, idx_5m 경계루프) 전부 불필요해져 삭제 — 이제
+                    # ts_1m_ms[a_p1["index"]]처럼 직접 조회. "형성중 5분봉 vs 마감된 5분봉"
+                    # 이중 추적(forming_high/low + memo_max_h/min_l)도 p1(직전 확정 피봇)이
+                    # 바뀔 때만 리셋되는 단일 running_extreme_price/idx로 통합(시드는 확정
+                    # 지연 구간 포함 위해 p1_idx+1..현재 슬라이스 1회 스캔, 이후 O(1) 증분).
+                    # 🚨 클램프 결함 수정(사용자 지적, 구현 전): running_extreme을 그대로
+                    # extreme_price에 쓰면 p1 확정 직후 급격한 갭다운/갭업 시 파동 방향이
+                    # 뒤집히는 구조 파괴가 생김 — 구코드의 max(p1["price"], memo_max_h,
+                    # forming_high)/min(...) 암묵 클램프를 사용 시점에 명시적으로 재현
+                    # (extreme_price = max/min(p1["price"], running_extreme_price)).
+                    # 피봇 SET 자체가 5분봉 버전과 미세하게 달라질 수 있어(1분 wick 가시성)
+                    # 이번엔 필드별 비트 동일 검증이 아니라 피봇 개수/가격/시각 비교 리포트로
+                    # 검증(2021-09-07 BTC 플래시 크래시에서 5분봉이 놓친 진짜 저점을 1분봉이
+                    # 잡아낸 사례 확인 — 결함 아닌 1분 정밀도의 정당한 이점). `_5m.csv` 로딩
+                    # 자체를 제거(load_symbol이 df_1m만 반환) — 5m 데이터 제거 프로젝트
+                    # (A/B/C/이 단계) 완료.
+                    #
+                    # v9d3 (2026-08-04): adx_5m/atr_5m/volatility_ratio/relative_volume_strength를
                     # df_5m(5분봉 DataFrame) 계산 대신 *_1m.csv의 5m_adx/5m_atr/5m_vol_ratio/
                     # 5m_vol_str 컬럼(전부 롤링/시프트 기반 인과적, 매분 갱신 — 직접 재구성해
                     # 상관계수 0.98~1.0으로 검증)으로 재계산. adx_5m/atr_5m/volatility_ratio는
@@ -95,7 +126,7 @@ CACHE_VER = "v9d3"  # 2026-08-04: adx_5m/atr_5m/volatility_ratio/relative_volume
 
 DTYPE_V9 = [
     ("i_1m", "i4"),
-    ("i_5m", "i4"),
+    ("i_5m", "i4"),                          # 2026-08-05부터 i_1m과 동일값(피봇이 1분 네이티브가 되며 중복) — 스키마 안정성 위해 필드는 유지
     ("ts_1m", "i8"),                         # ms
     ("high", "f4"),
     ("low", "f4"),
@@ -136,37 +167,33 @@ REPORT_FIELDS = [
 
 
 def load_symbol(symbol, recent_days=None):
-    df_5m = pd.read_csv(os.path.join(DATA_DIR, f"{symbol}_5m.csv"))
+    # 2026-08-05: 5m 데이터 완전 제거 — 피봇 검출도 1분봉에서 직접 하므로 _5m.csv 자체를
+    # 안 읽는다(prep_features.py 전체에서 5분봉 데이터 의존 소멸).
     df_1m = pd.read_csv(os.path.join(DATA_DIR, f"{symbol}_1m.csv"))
-    for df in (df_5m, df_1m):
-        if df["ts"].dtype in (np.int64, np.float64):
-            df["ts_dt"] = pd.to_datetime(df["ts"], unit="ms")
-        else:
-            df["ts_dt"] = pd.to_datetime(df["ts"])
+    if df_1m["ts"].dtype in (np.int64, np.float64):
+        df_1m["ts_dt"] = pd.to_datetime(df_1m["ts"], unit="ms")
+    else:
+        df_1m["ts_dt"] = pd.to_datetime(df_1m["ts"])
     # OHLC 결측 행 제거 (BTC 1m 원본에 NaN 행 존재 확인됨 — NaN이 관측/보상에 전파되는 것 방지)
-    df_5m = df_5m.dropna(subset=["open", "high", "low", "close"])
     df_1m = df_1m.dropna(subset=["open", "high", "low", "close"])
-    df_5m = df_5m.sort_values("ts_dt").reset_index(drop=True)
     df_1m = df_1m.sort_values("ts_dt").reset_index(drop=True)
 
     if recent_days is not None:
         cutoff = df_1m["ts_dt"].iloc[-1] - pd.Timedelta(days=recent_days)
-        df_5m = df_5m[df_5m["ts_dt"] >= cutoff].reset_index(drop=True)
         df_1m = df_1m[df_1m["ts_dt"] >= cutoff].reset_index(drop=True)
-    return df_5m, df_1m
+    return df_1m
 
 
 def build_cache(symbol, recent_days=None, n=None, min_diff=None):
     params = PIVOT_PARAMS.get(symbol, {"n": PIVOT_N, "min_diff": PIVOT_MIN_DIFF})
     n = params["n"] if n is None else n
     min_diff = params["min_diff"] if min_diff is None else min_diff
-    print(f"[{symbol}] pivot params: n={n}, min_diff={min_diff}")
+    print(f"[{symbol}] pivot params: n={n} (1분봉 기준, PIVOT_PARAMS에 이미 x5 반영됨), min_diff={min_diff}")
     t0 = time.time()
     print(f"\n=== [{symbol}] loading data ===")
-    df_5m, df_1m = load_symbol(symbol, recent_days)
-    total_5m = len(df_5m)
+    df_1m = load_symbol(symbol, recent_days)
     total_1m = len(df_1m)
-    print(f"5m rows: {total_5m:,} / 1m rows: {total_1m:,}")
+    print(f"1m rows: {total_1m:,}")
 
     # adx_5m/atr_5m/volatility_ratio/relative_volume_strength(2026-08-04 C단계):
     # *_1m.csv의 5m_adx/5m_atr/5m_vol_ratio/5m_vol_str 컬럼(전부 롤링/시프트 기반 인과적
@@ -176,75 +203,33 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
     vol_ratio_1m_arr = df_1m["5m_vol_ratio"].fillna(1.0).values   # 기존 폴백값(1.0) 유지
     vol_str_1m_arr = df_1m["5m_vol_str"].fillna(0.0).values
 
-    highs_5m = df_5m["high"].values
-    lows_5m = df_5m["low"].values
-    ts_5m_dt = df_5m["ts_dt"].values
-
     highs_1m = df_1m["high"].values
     lows_1m = df_1m["low"].values
     closes_1m = df_1m["close"].values
-    ts_1m_dt = df_1m["ts_dt"].values
     # 🚨 반드시 ns 해상도를 경유해 epoch ms로 변환할 것 (2026-07-19 버그 수정).
     # pandas 3.x는 날짜 문자열을 datetime64[us]로 파싱하므로 astype(int64)의 단위가
     # 환경(pandas 버전)에 따라 ns/us로 달라짐 — us//10^6은 "초"가 되어 ts_1m 캐시가
     # 초 단위로 저장됐고, ms를 가정하는 wave_age_min(→ d5/d15 관측 게이트 전멸),
     # trades_per_month(1000배), yearly_breakdown(1970년) 등이 연쇄로 깨졌었음.
     ts_1m_ms = (df_1m["ts_dt"].astype("datetime64[ns]").astype("int64") // 10**6).values
-    ts_5m_ms = (df_5m["ts_dt"].astype("datetime64[ns]").astype("int64") // 10**6).values
-
-    # wave_duration_day 타임스탬프화(2026-08-04)용 사전 계산: 각 5분봉의 고가/저가가
-    # 그 캔들 내 정확히 몇 분에 발생했는지 미리 찾아둔다. 5분봉 시가(ts_5m_ms)로
-    # 뭉뚱그리면 "형성 중 → 마감" 전환 순간 정밀 시각에서 캔들 시가로 정보가 깎여
-    # wave_duration_day가 시간이 흘렀는데도 줄어드는 역전이 생긴다(실측 확인) — 그래서
-    # 마감 여부와 무관하게 항상 같은 정밀도로 조회할 수 있도록 전 5분봉에 대해 1회만 계산.
-    # 2026-08-04 (B단계) 확장: 위 루프에서 이미 구하는 argmax/argmin 오프셋을 1분 행
-    # 인덱스로도 같이 저장 — RSI 다이버전스 탐색 구간의 시작/끝(a_p2/a_p1)을 rsi_1m_arr에
-    # 직접 인덱싱하기 위함. 값 자체(ts_5m_*_precise_ms)는 계산 경로만 바뀌었을 뿐 A 단계에서
-    # 이미 검증된 값과 완전히 동일 — 데이터 갭(e<=s) 폴백도 대응하는 1분 행이 없을 수 있어
-    # 캔들 시가 대신 가장 가까운 유효 행으로 클램프하도록 보강했다.
-    m5_open_1m_idx = np.searchsorted(ts_1m_dt, ts_5m_dt)
-    m5_close_1m_idx = np.append(m5_open_1m_idx[1:], total_1m)
-    ts_5m_high_precise_ms = np.empty(total_5m, dtype=np.int64)
-    ts_5m_low_precise_ms = np.empty(total_5m, dtype=np.int64)
-    ts_5m_high_precise_idx1m = np.empty(total_5m, dtype=np.int64)
-    ts_5m_low_precise_idx1m = np.empty(total_5m, dtype=np.int64)
-    for k in range(total_5m):
-        s, e = m5_open_1m_idx[k], m5_close_1m_idx[k]
-        if e <= s:
-            fallback = min(max(s - 1, 0), total_1m - 1)
-            ts_5m_high_precise_idx1m[k] = fallback
-            ts_5m_low_precise_idx1m[k] = fallback
-            ts_5m_high_precise_ms[k] = ts_1m_ms[fallback]
-            ts_5m_low_precise_ms[k] = ts_1m_ms[fallback]
-            continue
-        ts_5m_high_precise_idx1m[k] = s + int(highs_1m[s:e].argmax())
-        ts_5m_low_precise_idx1m[k] = s + int(lows_1m[s:e].argmin())
-        ts_5m_high_precise_ms[k] = ts_1m_ms[ts_5m_high_precise_idx1m[k]]
-        ts_5m_low_precise_ms[k] = ts_1m_ms[ts_5m_low_precise_idx1m[k]]
 
     # RSI 다이버전스 3종(2026-08-04 B단계)용: 5분봉 RSI(rsis_5m) 대신 1분 컬럼 5m_rsi를
     # 직접 사용 — period-70 RSI(1분 종가 기준, 5분×14=70과 동일 스케일), Wilder RSI
     # 재계산으로 인과성(미래 데이터 미참조) 검증됨.
     rsi_1m_arr = df_1m["5m_rsi"].fillna(50.0).values
 
-    # --- 전역 피봇 (버그② 수정: 시간 오름차순 인과 검출) ---
-    # 구버전은 내림차순 df에 검출기를 돌린 뒤 인덱스를 되돌렸다 — 대칭 N-Bar 판정을 역순에
-    # 걸면 원래 시간축 기준으로는 오히려 확정을 더 앞당기는 결과가 됐다(algorithm.py 참고).
-    # 정순 1회 순회로 검출하고 각 피봇의 confirm_index(확정 봉)를 함께 받는다.
-    print("Calculating global pivots on 5m...")
-    global_pivots = find_dynamic_pivots(df_5m, n=n, min_diff=min_diff)
+    # --- 전역 피봇 (2026-08-05: 5m 데이터 완전 제거 — 1분봉에서 직접 검출) ---
+    # find_dynamic_pivots는 캔들 단위와 무관한 범용 함수 — df_1m을 그대로 넘기고, n도
+    # PIVOT_PARAMS에 이미 1분봉 기준(x5)으로 저장돼 있어 그대로 씀(min_diff는 가격
+    # 비율이라 스케일 불변, 그대로). 정순 1회 순회로 검출하고 각 피봇의 confirm_index(확정 봉)를
+    # 함께 받는다 — confirm_index 이하만 쓰면 인과성 보장(algorithm.py 참고).
+    print("Calculating global pivots on 1m...")
+    global_pivots = find_dynamic_pivots(df_1m, n=n, min_diff=min_diff)
     print(f"pivots: {len(global_pivots)}  ({time.time() - t0:.1f}s)")
 
     # --- 1m 순회: 파동 매핑 + 피처 추출 ---
     print("Mapping 1m rows to waves and extracting features...")
-    idx_5m = 0
     pivot_ptr = 0
-    forming_high = 0.0
-    forming_high_ts_ms = 0
-    forming_high_idx1m = 0
-    forming_low = 1e18
-    forming_low_ts_ms = 0
-    forming_low_idx1m = 0
 
     # pre-hit / wave-age 추적 (simulate_numba :114-131과 동일 리셋 규칙)
     prev_start = -1.0
@@ -253,14 +238,17 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
     prev_wave_start = -1.0
     wave_born_ms = -1
 
-    # 마감 캔들 구간 극값 메모 (idx_5m/피봇이 바뀔 때만 재계산)
-    # 버그① 수정: 극값과 함께 극점 봉 인덱스도 추적 — 합성 피봇이 실제 극점 봉을 가리키게 해
-    # (가격, RSI)를 같은 봉에서 읽는다
-    memo_key = (-1, -1)
-    memo_max_h = 0.0
-    memo_min_l = 1e18
-    memo_max_h_idx = -1
-    memo_min_l_idx = -1
+    # 확정 피봇(p1) 이후 "다음 반대방향 극점" 러닝 추적(2026-08-05, 5m 제거 최종단계):
+    # 구버전은 "형성 중인 5분봉의 극값"(forming_high/low)과 "이미 마감된 5분봉들의
+    # 극값"(memo_max_h/min_l)을 따로 추적해야 했는데, 1분봉은 모든 봉이 처리 즉시
+    # "마감"이라 그 구분이 없어진다 — p1이 바뀔 때만 리셋되는 단일 러닝 익스트림 하나로
+    # 통합. 리셋 시 p1_idx+1..현재 구간을 1회 스캔해 시드(확정 지연 구간까지 포함 —
+    # 러닝 방식으로 "p1 인지 시점"부터만 추적하면 그 구간을 놓친다, B단계에서 이미 검증된
+    # 결함 패턴), 이후 매 행 O(1) 증분. 총 스캔량은 각 행이 최대 한 번만 스캔되는
+    # 텔레스코핑 합이라 전체 O(total_1m).
+    running_extreme_price = 0.0
+    running_extreme_idx = -1
+    running_key_p1_idx = -1
 
     # RSI 다이버전스 탐색 구간 메모(2026-08-04 B단계): (a_p2_idx1m, a_p1_idx1m)가 탐색
     # 구간을 완전히 결정하므로 이 조합이 바뀔 때만 argmax/argmin을 다시 돌린다.
@@ -277,33 +265,14 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
         if i % 200000 == 0 and i > 0:
             print(f"  {i:,}/{total_1m:,}  ({time.time() - t_loop:.1f}s)")
 
-        cur_ts = ts_1m_dt[i]
-        while idx_5m + 1 < total_5m and cur_ts >= ts_5m_dt[idx_5m + 1]:
-            idx_5m += 1
-            forming_high = 0.0
-            forming_high_ts_ms = 0
-            forming_high_idx1m = 0
-            forming_low = 1e18
-            forming_low_ts_ms = 0
-            forming_low_idx1m = 0
-
-        if idx_5m < WARMUP_5M:
+        if i < WARMUP_1M:
             continue
-
-        if highs_1m[i] > forming_high:
-            forming_high = highs_1m[i]
-            forming_high_ts_ms = ts_1m_ms[i]
-            forming_high_idx1m = i
-        if lows_1m[i] < forming_low:
-            forming_low = lows_1m[i]
-            forming_low_ts_ms = ts_1m_ms[i]
-            forming_low_idx1m = i
 
         # 버그② 수정 (admission 가드): 구버전은 `index <= idx_5m - n`으로 거리 조건만 보고
         # 가격 조건(min_diff)을 빼먹어, 반등이 min_diff에 도달하기 전에 피봇을 확정 처리했다
         # (실측 최대 47봉=3.9시간 미래 선행). 검출기가 두 조건을 모두 만족한 봉을
         # confirm_index로 알려주므로, 그 봉이 마감된 뒤에만 사용한다.
-        while pivot_ptr < len(global_pivots) and global_pivots[pivot_ptr]["confirm_index"] < idx_5m:
+        while pivot_ptr < len(global_pivots) and global_pivots[pivot_ptr]["confirm_index"] < i:
             pivot_ptr += 1
         if pivot_ptr < 2:
             continue
@@ -314,42 +283,37 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
 
         # 확정 피봇 이후의 신규 극점(forming 포함) 추적 — V7/V8과 동일
         extreme_type = "high" if p1["type"] == "low" else "low"
-        if p1_idx + 1 <= idx_5m - 1:
-            if memo_key != (p1_idx, idx_5m):
-                seg_h = highs_5m[p1_idx + 1:idx_5m]
-                seg_l = lows_5m[p1_idx + 1:idx_5m]
-                off_h = int(seg_h.argmax())
-                off_l = int(seg_l.argmin())
-                memo_max_h = seg_h[off_h]
-                memo_min_l = seg_l[off_l]
-                memo_max_h_idx = p1_idx + 1 + off_h
-                memo_min_l_idx = p1_idx + 1 + off_l
-                memo_key = (p1_idx, idx_5m)
-            # 버그① 수정: forming 봉은 마감 구간 극값을 '초과'할 때만 극점(동률이면 RSI가
-            # 존재하는 마감봉 우선). p1 자신이 극값이면 diff=0이라 어차피 합성 안 됨.
+        if running_key_p1_idx != p1_idx:
+            # p1이 막 바뀐 첫 행 — p1_idx+1..i 구간을 1회 스캔해 정확히 시드
+            seg_h = highs_1m[p1_idx + 1: i + 1]
+            seg_l = lows_1m[p1_idx + 1: i + 1]
             if extreme_type == "high":
-                extreme_price = max(p1["price"], memo_max_h, forming_high)
-                if forming_high > max(memo_max_h, p1["price"]):
-                    extreme_idx = idx_5m
-                elif memo_max_h >= p1["price"]:
-                    extreme_idx = memo_max_h_idx
-                else:
-                    extreme_idx = p1_idx
+                off = int(seg_h.argmax())
+                running_extreme_price, running_extreme_idx = seg_h[off], p1_idx + 1 + off
             else:
-                extreme_price = min(p1["price"], memo_min_l, forming_low)
-                if forming_low < min(memo_min_l, p1["price"]):
-                    extreme_idx = idx_5m
-                elif memo_min_l <= p1["price"]:
-                    extreme_idx = memo_min_l_idx
-                else:
-                    extreme_idx = p1_idx
+                off = int(seg_l.argmin())
+                running_extreme_price, running_extreme_idx = seg_l[off], p1_idx + 1 + off
+            running_key_p1_idx = p1_idx
         else:
             if extreme_type == "high":
-                extreme_price = max(p1["price"], forming_high)
-                extreme_idx = idx_5m if forming_high > p1["price"] else p1_idx
+                if highs_1m[i] > running_extreme_price:
+                    running_extreme_price, running_extreme_idx = highs_1m[i], i
             else:
-                extreme_price = min(p1["price"], forming_low)
-                extreme_idx = idx_5m if forming_low < p1["price"] else p1_idx
+                if lows_1m[i] < running_extreme_price:
+                    running_extreme_price, running_extreme_idx = lows_1m[i], i
+
+        # 🚨 클램프 필수(2026-08-05 결함 수정, 구현 전 사용자 지적): running_extreme을
+        # 그대로 쓰면 p1 확정 직후 급격한 갭다운/갭업으로 이후 구간의 실제 극값이
+        # p1["price"]를 역행할 때(예: low=100 확정 직후 그 뒤 모든 high가 100 미만),
+        # "low(100) 다음에 그보다 낮은 high(90)"처럼 파동 방향이 뒤집히는 구조 파괴가
+        # 생긴다. 구코드의 max(p1["price"], memo_max_h, forming_high)/min(...) 암묵
+        # 클램프를 사용 시점에 명시적으로 재현.
+        if extreme_type == "high":
+            extreme_price = max(p1["price"], running_extreme_price)
+            extreme_idx = running_extreme_idx if running_extreme_price > p1["price"] else p1_idx
+        else:
+            extreme_price = min(p1["price"], running_extreme_price)
+            extreme_idx = running_extreme_idx if running_extreme_price < p1["price"] else p1_idx
 
         diff_val = abs(p1["price"] - extreme_price)
         if diff_val >= min(p1["price"], extreme_price) * min_diff:
@@ -366,45 +330,28 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
 
         wave_scale = abs(end_price - start_price) / start_price * 100
 
-        # wave_duration_day (2026-08-04 타임스탬프 기반 재설계, V9 Design TODO 문서 참고):
-        # 인덱스 개수차×5분 대신 실제 극값 발생 시각의 차를 쓴다 — a_p1/a_p2의 인덱스
-        # 표현(5분봉)은 전혀 안 바꾸므로 RSI 다이버전스/vol_idx/피봇 검출은 무관.
-        # a_p1이 형성 중(index==idx_5m)이면 그 극값이 실제로 갱신된 정밀 분(forming_*_ts_ms),
-        # 아니면 그 5분봉의 사전계산된 정밀 발생 시각(ts_5m_*_precise_ms) — 캔들이 마감돼
-        # 이 분기가 바뀌는 순간에도 두 값이 동일해 경계에서 값이 끊기지 않는다.
-        a_p1_type = a_p1["type"]
-        if a_p1["index"] == idx_5m:
-            a_p1_ts_ms = forming_high_ts_ms if a_p1_type == "high" else forming_low_ts_ms
-        else:
-            a_p1_ts_ms = (ts_5m_high_precise_ms[a_p1["index"]] if a_p1_type == "high"
-                          else ts_5m_low_precise_ms[a_p1["index"]])
-        a_p2_type = a_p2["type"]
-        a_p2_ts_ms = (ts_5m_high_precise_ms[a_p2["index"]] if a_p2_type == "high"
-                      else ts_5m_low_precise_ms[a_p2["index"]])
+        # wave_duration_day (2026-08-05: 피봇이 1분봉 네이티브가 되며 a_p1["index"]/
+        # a_p2["index"]가 이미 1분 행 번호라 바로 조회 — A/B단계의 "5분 인덱스 ↔ 1분
+        # 정밀 시각" 변환 장치(ts_5m_*_precise_ms 등)가 통째로 불필요해짐).
+        a_p1_ts_ms = ts_1m_ms[a_p1["index"]]
+        a_p2_ts_ms = ts_1m_ms[a_p2["index"]]
         wave_duration_day = max(0.001, (a_p1_ts_ms - a_p2_ts_ms) / 86_400_000)
 
-        # wave age + RSI 다이버전스 탐색 시작점(2026-08-04 B단계): 파동 시작점(start_price)이
-        # 바뀌면 신규 파동으로 간주 — a_p2 자신이 실제로 찍힌 정밀 1분 행을 정적 배열에서
-        # 바로 조회해 탐색 시작점으로 고정한다(확정 지연 구간도 이미 배열에 존재하므로
-        # 러닝 상태로 쌓을 필요 없음 — 자세한 이유는 V9 Design TODO 문서 B단계 참고).
+        # wave age + RSI 다이버전스 탐색 시작점(B단계 로직 유지, 2026-08-05: a_p2_idx1m을
+        # a_p2["index"] 그대로 대입 — 이미 1분 인덱스라 변환 불필요). 파동 시작점
+        # (start_price)이 바뀌면 신규 파동으로 간주.
         if start_price != prev_wave_start:
             prev_wave_start = start_price
             wave_born_ms = ts_1m_ms[i]
-            a_p2_type = a_p2["type"]
-            a_p2_idx1m = (ts_5m_high_precise_idx1m[a_p2["index"]] if a_p2_type == "high"
-                          else ts_5m_low_precise_idx1m[a_p2["index"]])
+            a_p2_idx1m = a_p2["index"]
             div_win_key = None  # 아래에서 강제 재계산되도록
         wave_age_min = (ts_1m_ms[i] - wave_born_ms) / 60000.0
 
-        # RSI 다이버전스 3종(2026-08-04 B단계, *_1m.csv의 5m_rsi 컬럼 기반 재설계):
-        # 탐색 구간 끝(a_p1)은 wave_duration_day와 동일한 형성/고정 분기 — 형성 중이면
-        # 라이브(forming_*_idx1m), 고정되면 a_p1의 정밀 1분 행. div_price_gap(end_price=
-        # a_p1["price"])과 항상 같은 시점을 보게 되어 세 필드 간 시점 분열이 없다.
-        if a_p1["index"] == idx_5m:
-            a_p1_idx1m = forming_high_idx1m if a_p1_type == "high" else forming_low_idx1m
-        else:
-            a_p1_idx1m = (ts_5m_high_precise_idx1m[a_p1["index"]] if a_p1_type == "high"
-                          else ts_5m_low_precise_idx1m[a_p1["index"]])
+        # RSI 다이버전스 3종(B단계 로직 유지, 2026-08-05: a_p1_idx1m도 a_p1["index"]
+        # 그대로 대입 — "형성중/고정" 분기 자체가 불필요해짐, 더 이상 형성중 5분봉이
+        # 없으므로). div_price_gap(end_price=a_p1["price"])과 항상 같은 시점을 보게 되어
+        # 세 필드 간 시점 분열이 없다.
+        a_p1_idx1m = a_p1["index"]
 
         div_win_key_now = (a_p2_idx1m, a_p1_idx1m)
         if div_win_key_now != div_win_key:
@@ -416,16 +363,14 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
             div_ref_price = float(highs_1m[j_idx1m] if is_bullish else lows_1m[j_idx1m])
 
         rsi_now = rsi_1m_arr[i]              # 관측값: 항상 라이브(파동과 무관)
-        rsi_end = rsi_1m_arr[a_p1_idx1m]     # 다이버전스 계산용: a_p1 위치(형성 중이면 라이브)에 고정
+        rsi_end = rsi_1m_arr[a_p1_idx1m]     # 다이버전스 계산용: a_p1 위치에 고정
         div_rsi_gap = max(0.0, (div_rsi_ref - rsi_end) if is_bullish else (rsi_end - div_rsi_ref))
         dist_from_div_peak_to_end = max(0.001, (a_p1_ts_ms - ts_1m_ms[j_idx1m]) / 86_400_000)
         div_price_gap = (abs(end_price - div_ref_price) / div_ref_price * 100
                          if div_ref_price > 0 else 0.0)
 
-        # 볼륨 상대강도(2026-08-04 C단계): 파동 끝 피봇 캔들(a_p1) 볼륨의 트레일링
-        # 500(5분봉 환산)캔들 백분위. a_p1_idx1m(B단계, 형성 중이면 라이브)에 그대로
-        # 인덱싱 — 5m_vol_str이 1분 인과적 배열이라 예전처럼 "직전 마감봉"으로 클램프할
-        # 필요가 없어짐(클램프 제거가 오히려 더 정확함: 형성 중에도 정밀 시각 조회).
+        # 볼륨 상대강도(C단계 로직 유지): 파동 끝 피봇 캔들(a_p1) 볼륨의 트레일링
+        # 500(5분봉 환산)캔들 백분위. a_p1_idx1m에 그대로 인덱싱.
         vol_strength = vol_str_1m_arr[a_p1_idx1m]
 
         # pre-hit 0.382 추적 (파동 start/end가 바뀌면 리셋 — simulate_numba와 동일)
@@ -452,7 +397,7 @@ def build_cache(symbol, recent_days=None, n=None, min_diff=None):
         ret_1h = closes_1m[i] / closes_1m[i - 60] - 1.0 if i >= 60 else 0.0
 
         rows.append((
-            i, idx_5m, int(ts_1m_ms[i]),
+            i, i, int(ts_1m_ms[i]),   # i_5m: 2026-08-05부터 i_1m과 동일값(피봇이 1분 네이티브가 되며 중복)
             highs_1m[i], lows_1m[i], closes_1m[i],
             1 if is_bullish else 0,
             start_price, end_price,

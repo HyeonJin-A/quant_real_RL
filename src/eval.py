@@ -51,10 +51,12 @@ NEAR_LIQUIDATION_THRESHOLD = -95.0  # 증거금(100) 거의 다 날린 거래 �
 # 재발 방지책 두 가지: ① 버전을 명시적으로 고를 수 있는 --cache-ver CLI 옵션 추가(기본값은
 # 항상 최신 CACHE_VER — 신규 학습/평가엔 그대로 동작). ② env.py에 스키마 검증 가드 추가 —
 # 캐시 필드가 요구 스키마와 다르면 이제 조용히 넘어가지 않고 즉시 에러를 던진다.
-CACHE_VER = "v9d3"  # prep_features.CACHE_VER와 반드시 동기화할 것 (2026-08-04: v9d2->v9d3,
-                    # adx_5m/atr_5m/volatility_ratio/relative_volume_strength를 1분 컬럼
-                    # 기반으로 재계산). 구버전(v9c/v9d1/v9d2 등) 체크포인트 평가 시엔
-                    # --cache-ver로 명시할 것 — 안 하면 이 기본값(최신)을 조용히 먹는다.
+CACHE_VER = "v9d4"  # prep_features.CACHE_VER와 반드시 동기화할 것 (2026-08-05: v9d3->v9d4,
+                    # 5m 데이터 완전 제거 — 피봇 검출 자체를 1분봉에서 직접 수행, _5m.csv
+                    # 로딩 자체가 사라짐). 피봇 SET이 5분봉 버전과 미세하게 달라질 수 있어
+                    # 값 분포가 유의미하게 변함 — 구버전(v9c/v9d1/v9d2/v9d3 등) 체크포인트
+                    # 평가 시엔 --cache-ver로 반드시 명시할 것 — 안 하면 이 기본값(최신)을
+                    # 조용히 먹는다.
 
 
 def cache_path_for(symbol, suffix="", cache_ver=None):
