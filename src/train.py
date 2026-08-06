@@ -48,8 +48,8 @@ torch.set_num_threads(1)
 sys.path.insert(0, os.path.dirname(__file__))
 from env import TradingEnvV9  # noqa: E402
 from eval import (cache_path_for, split_bounds, run_policy_on_ranges, compute_metrics,  # noqa: E402
-                  compound_metrics, monthly_sel_score, v9_kpi, MIN_TRADES_PER_MONTH,
-                  MAX_COMPOUND_MDD_PCT)
+                  compound_metrics, monthly_sel_score, v10_kpi, MIN_TRADES_PER_MONTH,
+                  MAX_COMPOUND_MDD_PCT, MIN_WORST_EQUITY)
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 MODEL_DIR = os.path.join(ROOT_DIR, "models")
@@ -154,10 +154,10 @@ def build_callbacks(args, cache_paths, bounds, run_name, env_kwargs):
             if self.num_timesteps - self.last_eval < self.eval_freq:
                 return True
             self.last_eval = self.num_timesteps
-            btc_sel = None  # BTC 월별 log-multiple (v9_kpi의 수익성 항)
+            btc_sel = None  # BTC 월별 log-multiple (참고 기록용, 선택 기준 아님)
             btc_logs_m = None
-            btc_kpi = None  # BTC v9_kpi — best 선택 점수 (2026-07-28부터 선택 기준)
-            btc_kpi_z = None
+            btc_kpi = None  # BTC v10_kpi — best 선택 점수 (2026-08-06부터 선택 기준)
+            btc_kpi_detail = None
             btc_mdd_pct = None   # ⚠️ 루프 밖에서 m/cm을 쓰면 마지막 심볼(ETH) 값이므로 별도 보관
             btc_msl = None
             btc_eligible = False
@@ -180,10 +180,10 @@ def build_callbacks(args, cache_paths, bounds, run_name, env_kwargs):
                 m = compute_metrics(trades, int(ts[lo]), int(ts[hi - 1]))
                 for key in ("trades", "trades_per_month", "win_rate", "total_pnl",
                             "max_single_loss", "pnl_std",
-                            "near_liq_n", "near_liq_pct", "max_upnl"):
+                            "near_liq_n", "near_liq_pct", "max_upnl", "worst_equity"):
                     self.logger.record(f"valid/{sym}/{key}", m[key])
                 # 복리(전액 재투입) 지표 — 실전 운용 방식 기준 참고용 기록 (2026-07-19 추가).
-                # 모델 선택에는 compound_mdd_pct만 관여(v9_kpi의 z_mdd 항).
+                # 모델 선택에는 compound_mdd_pct만 관여(v10_kpi 점수엔 안 섞이고 하드게이트 전용).
                 cm = compound_metrics(trades, int(ts[lo]), int(ts[hi - 1]))
                 self.logger.record(f"valid/{sym}/compound_multiple", cm["multiple"])
                 self.logger.record(f"valid/{sym}/compound_mdd_pct", cm["mdd_pct"])
@@ -202,26 +202,34 @@ def build_callbacks(args, cache_paths, bounds, run_name, env_kwargs):
                     # 99% 체크포인트가 걸러지지 않았음. 월 12표본이라 분기 4표본보다 분산
                     # 추정도 안정적. 레짐 편중 감점(−std)이라는 취지는 그대로 계승.
                     # (2026-07-25: v9_score 자체를 TB 기록에서도 완전 폐기)
+                    # 2026-08-06: sel_monthly_log는 더 이상 선택 기준이 아니라 참고 기록용
+                    # (v10_kpi가 대체) — 그래도 월별 복리 궤적을 TB/best_info에서 보기 위해 유지.
                     btc_sel, btc_logs_m = monthly_sel_score(trades, int(ts[lo]), int(ts[hi - 1]))
-                    # 2026-07-28: 선택 점수를 sel_monthly_log 단독 → v9_kpi(수익성:낙폭:꼬리위험
-                    # = 4:3:3 합성)로 교체. 안정성을 최우선으로 두겠다는 요구에 따라 낙폭
-                    # (compound_mdd_pct)과 단일 최대손실(max_single_loss)을 선택 기준에 직접 반영
-                    # (eval.py의 v9_kpi 상수 블록에 스케일 산출 근거 상세).
+                    # 선택 점수: v9_kpi(수익성:낙폭:꼬리위험 6:2:2 가중합) → v10_kpi(거래단위
+                    # t-통계량)로 교체 (eval.py v10_kpi 주석에 배경 상세). 저거래 체크포인트가
+                    # 표본분산이 우연히 작아 최고점을 찍는 왜곡이 반복 관측돼, 표본 크기가
+                    # 점수식에 직접 반영되는 방식으로 완전히 새로 설계.
                     btc_mdd_pct, btc_msl = cm["mdd_pct"], m["max_single_loss"]
-                    btc_kpi, btc_kpi_z = v9_kpi(btc_sel, btc_mdd_pct, btc_msl, detail=True)
+                    btc_kpi, btc_kpi_detail = v10_kpi(trades, detail=True)
                     # "무거래 = 월배수 1.0 = 중립"이 손실 정책보다 우대되는 함정 차단:
                     # 월평균 거래수 미달이면 best 후보 자격 자체를 박탈 (합격 기준 ①과 동일 문턱)
                     # 근접청산 건수(near_liq_n)가 0이 아니면 자격 박탈 (2026-07-26 추가):
                     # 점수만으로는 근접청산 위험을 감점만 할 뿐 걸러내지 못해, 월별 변동성이
                     # 우연히 낮게 나온 위험한 체크포인트가 best로 뽑힐 수 있음.
                     # 복리 MDD가 MAX_COMPOUND_MDD_PCT(70%) 이상이면 자격 박탈 (2026-07-28 추가):
-                    # v9_kpi가 낙폭을 감점하긴 하지만, 수익성/꼬리위험이 아주 좋으면 산술적으로는
-                    # 파산 수준(MDD 100%)도 이길 수 있어 하드게이트로 차단. ⚠️ 이 게이트를 한 번도
-                    # 통과하지 못한 런은 _best.zip이 아예 생성되지 않는다(의도된 동작 — 그런 런은
-                    # 애초에 실전 부적합. 실측: leverage=10 런 0727-0934는 MDD 최저 88.3%로 전멸).
+                    # v10_kpi는 낙폭을 전혀 안 보므로(거래단위 t-통계량뿐) 이 하드게이트가 낙폭
+                    # 통제의 유일한 수단이다 — v9_kpi 때보다 오히려 이 게이트의 역할이 커짐.
+                    # ⚠️ 이 게이트를 한 번도 통과하지 못한 런은 _best.zip이 아예 생성되지 않는다
+                    # (의도된 동작 — 그런 런은 애초에 실전 부적합. 실측: leverage=10 런 0727-0934는
+                    # MDD 최저 88.3%로 전멸).
+                    # worst_equity(월별 최악의 월말 잔고) < 60이면 자격 박탈 (2026-08-06 추가):
+                    # compound_mdd_pct는 전체 구간 통짜 복리 낙폭이라 "가장 나쁜 한 달"만 따로
+                    # 보진 못함 — 전체 MDD가 낮아도 특정 달에 계좌가 반토막 나는 체크포인트를
+                    # v10_kpi(거래단위 t-통계량)만으로는 못 걸러내므로 별도 게이트로 보강.
                     btc_eligible = (m["trades_per_month"] >= MIN_TRADES_PER_MONTH
                                      and m["near_liq_n"] == 0
-                                     and btc_mdd_pct < MAX_COMPOUND_MDD_PCT)
+                                     and btc_mdd_pct < MAX_COMPOUND_MDD_PCT
+                                     and m["worst_equity"] >= MIN_WORST_EQUITY)
                 if self.verbose:
                     print(f"[valid @{self.num_timesteps:,}] {sym}: "
                           f"trades={m['trades']} pnl={m['total_pnl']:+.1f}")
@@ -229,33 +237,33 @@ def build_callbacks(args, cache_paths, bounds, run_name, env_kwargs):
             # 내려가 BTC에서 잘하는 체크포인트를 놓쳤음. ETH는 지표 기록만 유지하는 참고용).
             if btc_sel is not None:
                 self.logger.record("valid/BTC-USDT-SWAP/sel_monthly_log", btc_sel)
-                self.logger.record("valid/BTC-USDT-SWAP/v9_kpi", btc_kpi)
-                # 항별 기여 분해 — 어느 축이 점수를 끌어올리고/깎고 있는지 TB에서 바로 보기 위함
-                for k, v in btc_kpi_z.items():
-                    self.logger.record(f"valid/BTC-USDT-SWAP/v9_kpi_z_{k}", v)
-                # 2026-07-29: best 비교는 원시 v9_kpi가 아니라 최근 N회(kpi_history) 이동평균으로
+                self.logger.record("valid/BTC-USDT-SWAP/v10_kpi", btc_kpi)
+                # 항별 상세(t-통계량 분해: mean/std/n) — TB에서 바로 보기 위함
+                for k, v in btc_kpi_detail.items():
+                    self.logger.record(f"valid/BTC-USDT-SWAP/v10_kpi_{k}", v)
+                # 2026-07-29: best 비교는 원시 v10_kpi가 아니라 최근 N회(kpi_history) 이동평균으로
                 # 수행 — 고립된 스파이크 1회보다 꾸준히 높았던 구간을 우대. 자격 게이트(거래수/
                 # 근접청산/MDD)는 여전히 "현재 시점" 기준으로 적용(과거 실격 구간이 지금 좋아졌다고
                 # 그 흔적만으로 통과시키지 않음).
                 self.kpi_history.append(btc_kpi)
                 smoothed_kpi = float(np.mean(self.kpi_history))
-                self.logger.record("valid/BTC-USDT-SWAP/v9_kpi_smoothed", smoothed_kpi)
+                self.logger.record("valid/BTC-USDT-SWAP/v10_kpi_smoothed", smoothed_kpi)
                 if btc_eligible and smoothed_kpi > self.best_score:
                     self.best_score = smoothed_kpi
                     path = os.path.join(model_dir, f"{run_name}_best")
                     self.model.save(path)
                     with open(path + "_info.json", "w", encoding="utf-8") as f:
                         json.dump({"timesteps": self.num_timesteps,
-                                   "btc_v9_kpi": round(btc_kpi, 4),
-                                   "btc_v9_kpi_smoothed": round(smoothed_kpi, 4),
-                                   "btc_v9_kpi_z": {k: round(v, 4) for k, v in btc_kpi_z.items()},
+                                   "btc_v10_kpi": round(btc_kpi, 4),
+                                   "btc_v10_kpi_smoothed": round(smoothed_kpi, 4),
+                                   "btc_v10_kpi_detail": {k: round(v, 4) for k, v in btc_kpi_detail.items()},
                                    "btc_sel_monthly_log": round(btc_sel, 4),
                                    "btc_compound_mdd_pct": round(btc_mdd_pct, 2),
                                    "btc_max_single_loss": round(btc_msl, 2),
                                    "btc_monthly_multiples": [round(float(np.exp(l)), 3) for l in btc_logs_m]}, f)
                     if self.verbose:
-                        print(f"[valid] new best (BTC v9_kpi {btc_kpi:+.4f}, smoothed {smoothed_kpi:+.4f} | "
-                              f"sel {btc_sel:+.4f} mdd {btc_mdd_pct:.1f}% msl {btc_msl:+.1f}) -> {path}.zip")
+                        print(f"[valid] new best (BTC v10_kpi {btc_kpi:+.4f}, smoothed {smoothed_kpi:+.4f} | "
+                              f"n={btc_kpi_detail['n']} mdd {btc_mdd_pct:.1f}% msl {btc_msl:+.1f}) -> {path}.zip")
             return True
 
     callbacks = [EntCoefSchedule(), ValidationCallback(args.eval_freq, kpi_smooth_window=args.kpi_smooth_window)]
@@ -297,9 +305,9 @@ def main():
                              "완전히 격리되진 않음 (6장 이력 참고)")
     parser.add_argument("--eval-freq", type=int, default=500_000)
     parser.add_argument("--kpi-smooth-window", type=int, default=3,
-                        help="best 체크포인트 선택에 쓰는 v9_kpi 이동평균 윈도(검증 회차 수, 기본 3). "
+                        help="best 체크포인트 선택에 쓰는 v10_kpi 이동평균 윈도(검증 회차 수, 기본 3). "
                              "단일 검증 스냅샷의 우연한 스파이크가 근소한 차이로 연속 우수 구간을 이기는 "
-                             "문제 대응 (2026-07-29) — 최근 N회 v9_kpi의 평균이 best_score보다 높을 때만 갱신")
+                             "문제 대응 (2026-07-29) — 최근 N회 v10_kpi의 평균이 best_score보다 높을 때만 갱신")
     parser.add_argument("--eval-segments", type=int, default=1)  # 2026-07-19: 세그먼트 분할 폐기 (경계 오차)
     parser.add_argument("--checkpoint-freq", type=int, default=1_000_000)
     parser.add_argument("--ent-coef-start", type=float, default=0.01,

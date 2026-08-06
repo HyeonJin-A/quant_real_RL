@@ -51,10 +51,11 @@ NEAR_LIQUIDATION_THRESHOLD = -95.0  # 증거금(100) 거의 다 날린 거래 �
 # 재발 방지책 두 가지: ① 버전을 명시적으로 고를 수 있는 --cache-ver CLI 옵션 추가(기본값은
 # 항상 최신 CACHE_VER — 신규 학습/평가엔 그대로 동작). ② env.py에 스키마 검증 가드 추가 —
 # 캐시 필드가 요구 스키마와 다르면 이제 조용히 넘어가지 않고 즉시 에러를 던진다.
-CACHE_VER = "v9d4"  # prep_features.CACHE_VER와 반드시 동기화할 것 (2026-08-05: v9d3->v9d4,
-                    # 5m 데이터 완전 제거 — 피봇 검출 자체를 1분봉에서 직접 수행, _5m.csv
-                    # 로딩 자체가 사라짐). 피봇 SET이 5분봉 버전과 미세하게 달라질 수 있어
-                    # 값 분포가 유의미하게 변함 — 구버전(v9c/v9d1/v9d2/v9d3 등) 체크포인트
+CACHE_VER = "v10"   # prep_features.CACHE_VER와 반드시 동기화할 것 (2026-08-05: v9d4->v10,
+                    # 이름만 변경(값 동일) — 앞으로 캐시 버전은 run_name과 동일 네이밍을
+                    # 따라감. v9d4 자체는 5m 데이터 완전 제거(피봇 검출을 1분봉에서 직접
+                    # 수행, _5m.csv 로딩 소멸) — 피봇 SET이 5분봉 버전과 미세하게 달라질 수
+                    # 있어 값 분포가 유의미하게 변함. 구버전(v9c/v9d1/v9d2/v9d3 등) 체크포인트
                     # 평가 시엔 --cache-ver로 반드시 명시할 것 — 안 하면 이 기본값(최신)을
                     # 조용히 먹는다.
 
@@ -158,7 +159,7 @@ def numpy_policy_if_supported(model):
 
 
 def run_policy_on_ranges(model, targets, n_segments=1, decision_stride=1, fee_rate=0.0005,
-                         max_hold_bars=None, leverage=None, use_numpy_policy=True):
+                         max_hold_bars=None, leverage=3.0, use_numpy_policy=True):
     """여러 독립 레인(심볼)을 한 배치로 동시 롤아웃. targets: [(key, cache_path, lo, hi), ...]
     → {key: trades}
 
@@ -227,7 +228,7 @@ def run_policy_on_ranges(model, targets, n_segments=1, decision_stride=1, fee_ra
 
 
 def run_policy_on_range(model, cache_path, lo, hi, n_segments=1, decision_stride=1, fee_rate=0.0005,
-                        max_hold_bars=None, leverage=None, use_numpy_policy=True):
+                        max_hold_bars=None, leverage=3.0, use_numpy_policy=True):
     """단일 구간 롤아웃 — `run_policy_on_ranges`(복수형)의 1개 타깃 래퍼(기존 시그니처 유지).
 
     기본 n_segments=1 = 세그먼트 분할 없음 (2026-07-19: 16분할 병렬은 경계 강제정산 + 재수렴
@@ -250,6 +251,7 @@ def compute_metrics(trades, ts_lo_ms, ts_hi_ms):
             "pnl_std": 0.0, "profit_factor": 0.0, "top1_share": 0.0,
             "mdd": 0.0, "months": months,
             "near_liq_n": 0, "near_liq_pct": 0.0, "max_upnl": 0.0,
+            "worst_equity": 100.0,
         }
     pnls = np.array([t["pnl"] for t in trades], dtype=np.float64)
     wins = pnls[pnls > 0]
@@ -277,6 +279,21 @@ def compute_metrics(trades, ts_lo_ms, ts_hi_ms):
     # 포함) 전체 중 최댓값 — 최종 실현 손익(top1)과 달리 "그 순간 관측값이 최대 몇 배까지
     # 갔었는가"를 담아, upnl_clip 상한을 몇으로 잡아야 극단값을 놓치지 않는지 판단하는 데 씀.
     max_upnl = max((t.get("max_upnl", 0.0) for t in trades), default=0.0)
+
+    # 2026-08-04: 월별(에피소드 단위) 최악의 최종 잔고 (worst_equity)
+    # 각 월을 자본 100.0으로 리셋했을 때, 가장 타격이 컸던 달의 월말 잔고
+    def ym(ms):
+        d = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+        return d.year * 12 + (d.month - 1)
+    
+    lo_ym, hi_ym = ym(ts_lo_ms), ym(ts_hi_ms)
+    mult = {k: 1.0 for k in range(lo_ym, hi_ym + 1)}
+    for t in trades:
+        k = ym(t["entry_ts"])
+        if k in mult:
+            mult[k] *= 1.0 + t["pnl"] / MARGIN_USDT
+    worst_equity = float(min(mult.values()) * MARGIN_USDT) if mult else 100.0
+
     return {
         "trades": int(len(pnls)),
         "trades_per_month": len(pnls) / months,
@@ -292,6 +309,7 @@ def compute_metrics(trades, ts_lo_ms, ts_hi_ms):
         "near_liq_n": near_liq,
         "near_liq_pct": near_liq_pct,
         "max_upnl": max_upnl,
+        "worst_equity": worst_equity,
     }
 
 
@@ -387,50 +405,52 @@ def monthly_sel_score(trades, ts_lo_ms, ts_hi_ms):
 
 
 # ---------------------------------------------------------------------------
-# v9_kpi — best 체크포인트 선택 점수 (2026-07-28 도입, sel_monthly_log 단독 기준 대체)
+# v10_kpi — best 체크포인트 선택 점수 (2026-08-06 도입, v9_kpi의 가중합성 방식 폐기)
 #
-# 안정성 최우선 요구에 따라 수익성(sel_monthly_log) + 낙폭(compound_mdd_pct) +
-# 꼬리위험(max_single_loss) 세 축을 6:2:2로 합성한다 (2026-07-29: 4:3:3→6:2:2, 수익성
-# 비중을 60%로 상향 — mdd:msl 상대 비율은 유지한 채 sel만 올림).
+# v9_kpi(수익성:낙폭:꼬리위험 6:2:2 가중합)는 저거래 체크포인트에서 표본분산이 우연히
+# 작게 나오면 z_sel이 폭주해 "거래 1건짜리"가 최고점을 찍는 사고가 반복 관측됐다
+# (2026-08-05~06 decay_frac/explore_bonus_start 스윕: BTC trades=1, win_rate=100%,
+# MDD=0%인 체크포인트가 v9_kpi 1.05로 정상 구간(0.6~0.8대)을 이겨버림). 근본 원인은
+# "표본 크기가 점수식에 반영되지 않는다"는 것 — 가중치를 재튜닝해도 해소 안 됨.
 #
-# ⚠️ 아래 상수는 절대 바꾸지 말 것 (바꾸면 과거 런과 점수 비교 불가):
-#   ValidationCallback은 `v9_kpi > best_score`로 **학습 초반 점수와 후반 점수를 비교**해
-#   best를 교체한다. 정규화 계수가 "지금까지 나온 표본의 통계"처럼 시간에 따라 변하면
-#   초반/후반 점수가 서로 다른 자로 잰 값이 되어 대소 비교 자체가 무의미해진다.
-#   그래서 러닝 z-score가 아니라 **고정 상수**를 쓴다.
+# v10_kpi는 거래단위 t-통계량으로 완전히 새로 설계한다:
+#   t = mean(trade_log_return) / (std(trade_log_return) / sqrt(n))
+# "이 정도 수익률이 우연이 아니라고 얼마나 확신할 수 있는가"를 직접 측정하는 표준
+# 통계량이라 표본이 적으면 표준오차(std/√n)가 커져서 자동으로 점수가 낮아진다 —
+# 별도 가중치나 shrinkage 없이 저거래 왜곡이 수식 자체로 차단됨. 임의 튜닝 상수도 없음.
 #
-# 스케일 산출 근거 (2026-07-28, 과거 4개 런 × BTC 검증 525회 중 하드게이트 통과분 실측):
-#   pooled std — sel_monthly_log 0.516 / compound_mdd_pct 17.1 / max_single_loss 12.1
-#   → 이 산포로 나눠야 세 항이 실제로 대등해진다. "값의 범위"(0~100 vs ±1.5)로 맞추면 틀림.
-#   IQR 기준도 검토했으나 max_single_loss의 꼬리가 두꺼워(min -81.3) 혼자 분산의 50.7%를
-#   차지해버려 기각. std 기준 + 4:3:3 가중 시 실측 분산기여 sel 37.0% / mdd 31.8% / msl 31.2%
-#   (2026-07-29 6:2:2로 재조정, 분산기여 재실측은 아직 없음 — 가중치만 사용자 지시로 변경).
-# 중심값(0 / 70 / -30)은 순위에 영향 없는 단순 오프셋 — v9_kpi≈0이 "평범한 체크포인트",
-#   +1이 "종합 1σ 우수"로 읽히게 하는 해석 편의용.
-# 주의: sel_monthly_log(−std 항)·compound_mdd_pct·max_single_loss는 서로 독립이 아니다
-#   (실측 상관 sel↔mdd +0.76, sel↔msl +0.24, mdd↔msl +0.52). 6:2:2는 원래 4:3:3(세 축
-#   균등이 아니라 [수익·낙폭] 축에 무게가 실린 구성)에서 수익성 비중을 한 단계 더 올린 것.
-V9_KPI_CENTER = {"sel": 0.0, "mdd": 70.0, "msl": -30.0}
-V9_KPI_SCALE = {"sel": 0.50, "mdd": 17.0, "msl": 12.0}
-V9_KPI_WEIGHT = {"sel": 6.0, "mdd": 2.0, "msl": 2.0}
-MAX_COMPOUND_MDD_PCT = 70.0   # best 후보 자격 하드게이트 (2026-07-28) — 이 이상은 실전 부적합
+# MDD/근접청산은 점수에 섞지 않고 순수 하드게이트로만 쓴다(아래 btc_eligible 참고) —
+# "수익성이 아주 좋으면 산술적으로 파산 수준 MDD도 이긴다"는 v9_kpi의 함정을 구조적으로
+# 차단. 거래별 꼬리위험(max_single_loss)은 별도 항으로 두지 않는다 — 큰 단일 손실은
+# std(trade_log_return)를 직접 키워 t를 낮추므로 이미 t 안에 반영되어 있다(중복 축 제거).
+def v10_kpi(trades, detail=False):
+    """best 체크포인트 선택 점수 (높을수록 좋음) = 거래별 log수익률의 t-통계량.
 
-
-def v9_kpi(sel_monthly_log, compound_mdd_pct, max_single_loss, detail=False):
-    """best 체크포인트 선택 점수 (높을수록 좋음). 세 지표 전부 "높을수록 좋음"으로 방향을
-    맞춘 뒤 고정 상수로 정규화해 6:2:2 가중 평균한다 (위 상수 블록 주석 참고).
-
-    compound_mdd_pct는 낮을수록, max_single_loss는 0에 가까울수록 좋으므로 부호를 뒤집는다.
-    detail=True면 항별 기여도를 함께 반환 (진단용, 선택 로직엔 미사용).
+    log수익률 r_i = ln(1 + pnl_i/MARGIN_USDT). n<2면 표준편차를 추정할 수 없어
+    -inf 처리(어차피 MIN_TRADES_PER_MONTH 게이트로도 후보 탈락). std가 0에 아주
+    가까우면(전 거래 동일 수익) t가 발산하니 1e-6로 하한을 둔다.
+    detail=True면 mean/std/n/t를 함께 반환 (진단용, 선택 로직엔 미사용).
     """
-    z = {
-        "sel": (float(sel_monthly_log) - V9_KPI_CENTER["sel"]) / V9_KPI_SCALE["sel"],
-        "mdd": (V9_KPI_CENTER["mdd"] - float(compound_mdd_pct)) / V9_KPI_SCALE["mdd"],
-        "msl": (float(max_single_loss) - V9_KPI_CENTER["msl"]) / V9_KPI_SCALE["msl"],
-    }
-    w_sum = sum(V9_KPI_WEIGHT.values())
-    score = sum(V9_KPI_WEIGHT[k] * z[k] for k in z) / w_sum
-    return (float(score), z) if detail else float(score)
+    r = np.array([np.log(max(1.0 + float(t["pnl"]) / MARGIN_USDT, 1e-6)) for t in trades],
+                 dtype=np.float64)
+    n = len(r)
+    if n < 2:
+        d = {"mean": float(r[0]) if n else 0.0, "std": 0.0, "n": n, "t_stat": -np.inf}
+        return (-np.inf, d) if detail else -np.inf
+    mean = float(r.mean())
+    std = float(r.std(ddof=1))
+    t_stat = mean / (max(std, 1e-6) / np.sqrt(n))
+    d = {"mean": mean, "std": std, "n": n, "t_stat": t_stat}
+    return (t_stat, d) if detail else t_stat
+
+
+MAX_COMPOUND_MDD_PCT = 70.0   # best 후보 자격 하드게이트 (2026-07-28) — 이 이상은 실전 부적합
+MIN_WORST_EQUITY = 60.0       # best 후보 자격 하드게이트 (2026-08-06) — 월별(에피소드 단위) 최악의
+                               # 월말 잔고(100 USDT 시작)가 이 밑으로 떨어진 적 있으면 실전 부적합.
+                               # compound_mdd_pct(전체 구간 통짜 복리)와 달리 "가장 나쁜 한 달"만
+                               # 떼어서 보는 지표라 서로 다른 실패 모드를 잡는다 — 전체 MDD가 낮아도
+                               # 특정 달에 계좌가 반토막 나는 체크포인트를 v10_kpi(거래단위 t-통계량)
+                               # 만으로는 못 걸러내므로 별도 게이트로 보강.
 
 
 def yearly_breakdown(trades):
@@ -479,7 +499,7 @@ def fmt_compound(cm):
 
 def evaluate(model, symbols, split, fee_rate=0.0005, decision_stride=1,
              n_segments=1, cache_suffix="", verbose=True,
-             max_hold_bars=None, leverage=None, final_split=False, cache_ver=None):
+             max_hold_bars=None, leverage=3.0, final_split=False, cache_ver=None):
     paths = {s: cache_path_for(s, cache_suffix, cache_ver=cache_ver) for s in symbols}
     bounds = split_bounds(list(paths.values()), final=final_split)
     report = {"split": split, "fee_rate": fee_rate, "symbols": {}}
@@ -502,24 +522,26 @@ def evaluate(model, symbols, split, fee_rate=0.0005, decision_stride=1,
         cm = compound_metrics(trades, int(ts[lo]), int(ts[hi - 1]))
         acc = acceptance(m, trades)
         sel, logs_m = monthly_sel_score(trades, int(ts[lo]), int(ts[hi - 1]))
-        kpi, kpi_z = v9_kpi(sel, cm["mdd_pct"], m["max_single_loss"], detail=True)
+        kpi, kpi_detail = v10_kpi(trades, detail=True)
         report["symbols"][sym] = {
             "metrics": m, "compound": cm, "acceptance": acc, "yearly": yearly_breakdown(trades),
-            "sel_monthly_log": sel, "v9_kpi": kpi, "v9_kpi_z": kpi_z,
+            "sel_monthly_log": sel, "v10_kpi": kpi, "v10_kpi_detail": kpi_detail,
         }
         all_trades.extend(trades)
         if verbose:
             print(f"\n=== [{sym}] {split} ===")
             print(fmt_metrics(m))
             print(fmt_compound(cm))
-            print(f"  [월별 복리] sel={sel:+.4f} (mean−std of ln m)  "
+            print(f"  [월별 복리, 참고용] sel={sel:+.4f} (mean−std of ln m)  "
                   f"m_i={[round(float(np.exp(l)), 2) for l in logs_m]}")
             # best 선택 점수 — 학습 중 ValidationCallback이 쓰는 것과 완전히 동일한 식
             gate = "통과" if (m["trades_per_month"] >= MIN_TRADES_PER_MONTH
                             and m["near_liq_n"] == 0
-                            and cm["mdd_pct"] < MAX_COMPOUND_MDD_PCT) else "탈락"
-            print(f"  [v9_kpi] {kpi:+.4f}  (sel {kpi_z['sel']:+.2f} / mdd {kpi_z['mdd']:+.2f} / "
-                  f"msl {kpi_z['msl']:+.2f}, 가중 6:2:2)  best후보 게이트: {gate}")
+                            and cm["mdd_pct"] < MAX_COMPOUND_MDD_PCT
+                            and m["worst_equity"] >= MIN_WORST_EQUITY) else "탈락"
+            print(f"  [v10_kpi] {kpi:+.4f}  (t-stat of trade log-return, "
+                  f"mean={kpi_detail['mean']:+.4f} std={kpi_detail['std']:.4f} n={kpi_detail['n']})  "
+                  f"best후보 게이트(MDD<{MAX_COMPOUND_MDD_PCT:.0f}%, worst_equity>={MIN_WORST_EQUITY:.0f}): {gate}")
             print(f"  acceptance: {acc}")
             print(f"  yearly: { {y: round(v['pnl'], 1) for y, v in yearly_breakdown(trades).items()} }")
 
@@ -548,9 +570,12 @@ def main():
                         help="캐시 스키마 버전 (예: v9bx, v9c). 미지정 시 최신(eval.CACHE_VER) 사용 — "
                              "구 스키마로 학습된 체크포인트를 재평가할 땐 반드시 그 학습 당시 버전을 "
                              "지정해야 함(2026-08-03 사고: 미지정 시 최신 캐시로 조용히 잘못 평가됨)")
-    parser.add_argument("--leverage", type=float, default=None,
-                        help="고정 레버리지. 학습 때 --leverage를 지정했다면 반드시 동일 값 지정 "
-                             "(liq_dist 관측 피처가 leverage에 의존하므로 불일치 시 평가가 왜곡됨)")
+    parser.add_argument("--leverage", type=float, default=3.0,
+                        help="고정 레버리지 (기본 3.0, train.py 기본값과 동일). 학습 때 --leverage를 "
+                             "다른 값으로 지정했다면 평가에도 반드시 그 값을 지정할 것 "
+                             "(liq_dist 관측 피처가 leverage에 의존하므로 불일치 시 평가가 왜곡됨 — "
+                             "2026-08-06: 과거 eval.py 기본값(None→env.py 구 기본 20.0)이 train.py "
+                             "기본값(3.0)과 어긋나 재평가가 통째로 파산으로 잘못 나온 사고 이후 통일)")
     parser.add_argument("--out", default=None, help="리포트 JSON 저장 경로")
     parser.add_argument("--final-split", action="store_true",
                         help="배포 전 최종학습용 95/5(train/valid) 분할 기준으로 평가 (test 없음, 2026-07-23)")

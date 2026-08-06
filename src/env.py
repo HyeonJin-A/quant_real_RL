@@ -88,7 +88,7 @@ class TradingEnvV9(gym.Env):
         end_idx=None,
         episode_len_rows=43200,      # 30일 (2026-07-19 60일 확대 → 2026-07-20 복귀: 60일 런 붕괴 실측, train.py 독스트링 참고)
         decision_stride=1,
-        leverage=20.0,
+        leverage=3.0,
         fee_rate=0.0007,
         max_hold_bars=DEFAULT_MAX_HOLD_BARS,
         fixed_full_range=False,      # True면 [start_idx, end_idx)를 단일 에피소드로 (평가용)

@@ -1,0 +1,1 @@
+{"timesteps": 76001520, "btc_v9_kpi": 0.9229, "btc_v9_kpi_smoothed": 0.9162, "btc_v9_kpi_z": {"sel": -0.0503, "mdd": 3.1526, "msl": 1.6125}, "btc_sel_monthly_log": -0.0251, "btc_compound_mdd_pct": 16.41, "btc_max_single_loss": -10.65, "btc_monthly_multiples": [1.023, 1.044, 1.006, 1.052, 1.057, 1.088, 1.312, 0.988, 0.984, 1.091, 1.019, 1.003, 1.0]}

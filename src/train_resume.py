@@ -51,7 +51,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, os.path.dirname(__file__))
 import train as _train_mod  # noqa: E402  # MODEL_DIR/MODE_SUBDIR를 런타임에 패치하기 위해 모듈 자체를 참조
 from train import ROOT_DIR, MODEL_DIR, LOG_DIR, LR_START, make_env_fn, build_callbacks  # noqa: E402
-from eval import cache_path_for, split_bounds, v9_kpi  # noqa: E402
+from eval import cache_path_for, split_bounds  # noqa: E402
 
 
 def _orig_run_name(resume_from):
@@ -118,10 +118,11 @@ def main():
     parser.add_argument("--resume-reset-best", action="store_true",
                         help="best_score/kpi_history를 이어받지 않고 -inf/빈 상태로 리셋")
     parser.add_argument("--seed-best-info", required=True,
-                        help="원 체크포인트의 _best_info.json 경로. btc_sel_monthly_log/"
-                             "btc_compound_mdd_pct/btc_max_single_loss를 현재 eval.v9_kpi 가중치로 "
-                             "재계산해 best_score/kpi_history 시드값으로 사용 (v9_kpi 가중치가 바뀐 "
-                             "적이 있어 원 파일의 btc_v9_kpi 원시값은 그대로 못 씀)")
+                        help="원 체크포인트의 _best_info.json 경로. btc_v10_kpi 원시값을 그대로 "
+                             "best_score/kpi_history 시드값으로 사용 (v10_kpi는 거래단위 t-통계량이라 "
+                             "v9_kpi 시절과 달리 조정 가능한 가중치가 없어 재계산 불필요 — 2026-08-06). "
+                             "v10_kpi 이전 포맷 파일(btc_v10_kpi 필드 없음)은 시드 불가, "
+                             "--resume-reset-best를 쓸 것")
 
     # --- 원 체크포인트와 반드시 일치해야 하는 값. 기본값은 0728-1924 베이스라인
     #     (models/best/v9_maskablerl_seed0_0728-1924_best.zip) 기준으로 고정 —
@@ -260,11 +261,15 @@ def main():
     elif args.seed_best_info:
         with open(args.seed_best_info, encoding="utf-8") as f:
             info = json.load(f)
-        seed_kpi = v9_kpi(info["btc_sel_monthly_log"], info["btc_compound_mdd_pct"], info["btc_max_single_loss"])
+        if "btc_v10_kpi" not in info:
+            raise SystemExit(f"[resume] ⚠️  {args.seed_best_info}는 v10_kpi 이전 포맷이라 시드 불가 "
+                              "(btc_v10_kpi 필드 없음). --resume-reset-best를 쓰거나 v10_kpi로 "
+                              "재평가한 정보 파일을 지정하세요.")
+        seed_kpi = info["btc_v10_kpi"]
         validation_cb.best_score = seed_kpi
         validation_cb.kpi_history.append(seed_kpi)
         print(f"[resume] best_score seeded from {args.seed_best_info}: {seed_kpi:+.4f} "
-              f"(현재 v9_kpi 가중치로 재계산 — kpi_history엔 이 값 1개만 시드, 나머지는 복구 불가)")
+              f"(원 파일의 btc_v10_kpi 원시값 그대로 사용 — kpi_history엔 이 값 1개만 시드, 나머지는 복구 불가)")
     else:
         print("[resume] ⚠️  --seed-best-info 미지정 — best_score가 -inf에서 시작해 첫 합격 검증이 "
               "무조건 best로 저장됨. 원 체크포인트보다 못한 모델이 best를 덮어쓸 수 있음.")
