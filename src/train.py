@@ -46,10 +46,10 @@ import torch
 torch.set_num_threads(1)
 
 sys.path.insert(0, os.path.dirname(__file__))
-from env import TradingEnvV9  # noqa: E402
+from env import TradingEnvV9, FEATURE_NAMES  # noqa: E402
 from eval import (cache_path_for, split_bounds, run_policy_on_ranges, compute_metrics,  # noqa: E402
                   compound_metrics, monthly_sel_score, v10_kpi, MIN_TRADES_PER_MONTH,
-                  MAX_COMPOUND_MDD_PCT, MIN_WORST_EQUITY)
+                  MAX_COMPOUND_MDD_PCT, MIN_WORST_EQUITY, CACHE_VER)
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 MODEL_DIR = os.path.join(ROOT_DIR, "models")
@@ -97,6 +97,21 @@ def build_callbacks(args, cache_paths, bounds, run_name, env_kwargs):
     from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
     model_dir = os.path.join(MODEL_DIR, MODE_SUBDIR, run_name)
     os.makedirs(model_dir, exist_ok=True)
+
+    # 2026-08-09: 피처 후진제거(ablation) 메타데이터 사이드카 — exclude_features가 빈 경우도
+    # 포함해 모든 런에 저장한다. eval.py --model이 이 파일을 자동으로 읽어 학습 때와 동일한
+    # exclude_features로 env를 재구성한다 (없으면 구 체크포인트로 간주해 전체 18피처 기본값).
+    # 목적: 서로 다른 두 exclude_features가 우연히 같은 관측 차원이 되는 경우에도(예: 각각
+    # 하나씩 제외한 두 실험) 이름 목록으로 정확히 구분해 "모양은 맞지만 의미가 다른" 조용한
+    # 오염을 방지 (2026-08-03 캐시 버전 사고와 동일한 실패 유형).
+    exclude_features = sorted(env_kwargs.get("exclude_features") or [])
+    with open(os.path.join(model_dir, f"{run_name}_features.json"), "w", encoding="utf-8") as f:
+        json.dump({
+            "exclude_features": exclude_features,
+            "obs_dim": len(FEATURE_NAMES) - len(exclude_features),
+            "cache_ver": getattr(args, "cache_ver", None) or CACHE_VER,
+            "leverage": args.leverage,
+        }, f, indent=2)
 
     class EntCoefSchedule(BaseCallback):
         """--ent-coef-hold-frac 지점까지 시작값 고정 유지 후, 나머지 구간에서만 선형 감쇠.
@@ -347,9 +362,16 @@ def main():
                              "SubprocVecEnv의 IPC 왕복이 스텝당 2회가 됐고, [64,64] 초소형 MLP라 연산량보다 "
                              "통신 비용이 커서 병렬화 이득이 역전됨(실측 fps 약 9,900 → 16,800, 약 1.7배). "
                              "--no-dummy-vec으로 기존 SubprocVecEnv 병렬 경로 사용 가능")
+    parser.add_argument("--exclude-features", nargs="*", default=[],
+                        help="관측에서 제외할 피처 이름(공백 구분, env.FEATURE_NAMES 중). "
+                             "기본 빈 리스트=전체 18개 사용 (2026-08-09 피처 후진제거 실험용)")
     args = parser.parse_args()
 
-    env_kwargs = {"leverage": args.leverage}
+    bad_features = sorted(set(args.exclude_features) - set(FEATURE_NAMES))
+    if bad_features:
+        raise SystemExit(f"--exclude-features: 알 수 없는 이름 {bad_features}; 허용: {list(FEATURE_NAMES)}")
+
+    env_kwargs = {"leverage": args.leverage, "exclude_features": tuple(sorted(set(args.exclude_features)))}
 
     # 2026-07-25: 메인(부모) 프로세스를 특정 코어에 100% 고정 (코어 널뛰기 완벽 방지). 2026-07-29: 상수(1) -> --main-core로 파라미터화.
     if hasattr(os, "sched_setaffinity"):

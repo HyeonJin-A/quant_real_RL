@@ -51,7 +51,8 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, os.path.dirname(__file__))
 import train as _train_mod  # noqa: E402  # MODEL_DIR/MODE_SUBDIR를 런타임에 패치하기 위해 모듈 자체를 참조
 from train import ROOT_DIR, MODEL_DIR, LOG_DIR, LR_START, make_env_fn, build_callbacks  # noqa: E402
-from eval import cache_path_for, split_bounds  # noqa: E402
+from eval import cache_path_for, split_bounds, load_feature_metadata  # noqa: E402
+from env import FEATURE_NAMES  # noqa: E402
 
 
 def _orig_run_name(resume_from):
@@ -159,9 +160,28 @@ def main():
     parser.add_argument("--explore-bonus-decay-frac", type=float, default=0.5)
     parser.add_argument("--cache-suffix", default="")
     parser.add_argument("--dummy-vec", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--exclude-features", nargs="*", default=None,
+                        help="관측에서 제외할 피처 이름(공백 구분, env.FEATURE_NAMES 중). "
+                             "미지정 시 --resume-from 옆 *_features.json 메타데이터에서 자동 로드 "
+                             "(원 체크포인트와 다른 exclude_features로 resume하면 관측 차원이 어긋나 "
+                             "MaskablePPO.load()에서 즉시 에러가 남 — 2026-08-09)")
     args = parser.parse_args()
 
-    env_kwargs = {"leverage": args.leverage}
+    if args.exclude_features is not None:
+        bad_features = sorted(set(args.exclude_features) - set(FEATURE_NAMES))
+        if bad_features:
+            raise SystemExit(f"--exclude-features: 알 수 없는 이름 {bad_features}; 허용: {list(FEATURE_NAMES)}")
+        exclude_features = args.exclude_features
+    else:
+        meta = load_feature_metadata(args.resume_from)
+        if meta is not None:
+            exclude_features = meta["exclude_features"]
+            print(f"[resume] exclude_features 자동 로드({args.resume_from} 옆 메타데이터): {exclude_features}")
+        else:
+            exclude_features = []
+            print(f"[resume] {args.resume_from} 옆에 *_features.json 없음 — 구 체크포인트로 간주, 전체 18피처 사용")
+
+    env_kwargs = {"leverage": args.leverage, "exclude_features": tuple(sorted(set(exclude_features)))}
 
     if hasattr(os, "sched_setaffinity"):
         try:

@@ -29,13 +29,27 @@ import gymnasium as gym
 from gymnasium import spaces
 
 MARGIN_USDT = 100.0
-OBS_DIM = 18      # 파동/시장 피처 (다이버전스 발생 플래그 포함, wave_age_min 중복 제거).
-                  # 2026-07-19: 포지션 상태 4칸 제거 — 옛 rule/adaptive 모드는 semi-MDP라 결정 시점에
-                  # 항상 무포지션이어서 영원히 0인 죽은 차원이었음. "rl" 모드 전용으로만 유지.
-                  # 2026-07-20: 타이밍 피처 4종 추가(14→18) — 현재 RSI(방향조정) + 트레일링
-                  # 수익률 3지평(5m/15m/1h, ATR 정규화). 승률 천장 ~27%의 원인이 "되돌림이
-                  # 이미 시작됐는지 판정할 정보 부재"(칼손절 즉사 분석)라는 진단에 따름.
-RL_OBS_DIM = 22   # "rl" 모드(보유 중 매 스텝 결정) 전용: 파동/시장 18 + 포지션 상태 4
+
+# 파동/시장 정적 피처 18종 — _build_static_obs의 np.stack 순서와 반드시 일치.
+# (다이버전스 발생 플래그 포함, wave_age_min은 wave_duration_day와 상관계수 0.87로
+# 중복이라 애초에 이 목록에 없음 — 2026-07-16.)
+# 2026-07-20: 타이밍 피처 4종 추가(14→18) — 현재 RSI(방향조정) + 트레일링
+# 수익률 3지평(5m/15m/1h, ATR 정규화). 승률 천장 ~27%의 원인이 "되돌림이
+# 이미 시작됐는지 판정할 정보 부재"(칼손절 즉사 분석)라는 진단에 따름.
+# 2026-08-09: exclude_features 메커니즘 도입 — 이 튜플이 TradingEnvV9(exclude_features=...),
+# train.py/eval.py의 --exclude-features CLI, 체크포인트 옆 {run_name}_features.json 메타데이터,
+# ablation_corr.py 상관분석이 전부 공유하는 유일한 이름 공간이다. 이름을 바꾸면 이미 저장된
+# 메타데이터 JSON과 어긋나므로 CACHE_VER급 버저닝 이벤트로 취급할 것(조용히 rename 금지).
+FEATURE_NAMES = (
+    "wave_scale", "wave_duration", "div_rsi_gap", "div_dist", "div_price_gap",
+    "vol_ratio", "vol_strength", "adx", "atr_pct", "is_bullish", "fib_pos",
+    "pre_hit_0382", "fib_delta_5m", "fib_delta_15m", "rsi_now_adj",
+    "ret_5m_atr", "ret_15m_atr", "ret_1h_atr",
+)
+# "rl" 모드(보유 중 매 스텝 결정) 전용: 위 정적 피처(exclude_features 적용 후 개수 가변,
+# 기본 18) + 포지션 상태 4칸(pos_dir/미실현손익/보유시간/청산가거리). 포지션 상태 4칸은
+# 2026-07-19: 옛 rule/adaptive 모드는 semi-MDP라 결정 시점에 항상 무포지션이어서 영원히
+# 0인 죽은 차원이었음 — "rl" 모드 전용으로만 유지.
 # 2026-07-20: rl 모드 자유 방향 선택(Open-Long/Short 구분, 옛 ACT_LONG/ACT_SHORT/ACT_CLOSE=3)
 # 폐기 — 방향은 fade 자동 고정, Discrete(4)→(3)으로 축소.
 ACT_HOLD, ACT_ENTER, ACT_CLOSE = 0, 1, 2
@@ -94,6 +108,9 @@ class TradingEnvV9(gym.Env):
         fixed_full_range=False,      # True면 [start_idx, end_idx)를 단일 에피소드로 (평가용)
         explore_bonus=0.0,           # 학습 커리큘럼 전용 (Enter 시 추가 보상, 학습 중반까지 감쇠 후 0).
                                       # 평가(eval_v9.py)는 항상 기본값 0.0으로 새 env를 만들므로 검증/테스트 점수엔 영향 없음.
+        exclude_features=None,       # iterable[str] ⊆ FEATURE_NAMES. None/빈 값 = 전체 18개(기본, 하위호환).
+                                      # 2026-08-09 피처 후진제거(ablation) 실험 전용 — 학습/평가 env가 반드시
+                                      # 동일 값을 받아야 함(체크포인트 옆 {run_name}_features.json 메타데이터로 보장).
     ):
         super().__init__()
 
@@ -121,7 +138,15 @@ class TradingEnvV9(gym.Env):
         self.end_price_raw = data["end_price"].astype(np.float64)
         self.atr_5m_raw = data["atr_5m"].astype(np.float64)
 
-        self.static_obs = self._build_static_obs(data)  # (n, 14) float32
+        self.exclude_features = tuple(sorted(set(exclude_features))) if exclude_features else ()
+        unknown = set(self.exclude_features) - set(FEATURE_NAMES)
+        if unknown:
+            raise ValueError(f"알 수 없는 exclude_features: {sorted(unknown)} (허용: {FEATURE_NAMES})")
+        self.static_obs, self.static_feature_names = self._build_static_obs(
+            data, exclude_features=self.exclude_features
+        )  # (n, obs_dim) float32
+        self.obs_dim = self.static_obs.shape[1]
+        self.rl_obs_dim = self.obs_dim + 4  # 정적 피처 + 포지션 상태 4칸
 
         self.episode_len_rows = int(episode_len_rows)
         self.decision_stride = max(1, int(decision_stride))
@@ -132,8 +157,7 @@ class TradingEnvV9(gym.Env):
         self.explore_bonus = float(explore_bonus)  # train_v9.py의 콜백이 학습 중 set_curriculum()으로 갱신
 
         self.action_space = spaces.Discrete(3)  # 2026-07-20: {Hold, Enter(fade 자동), Close}
-        self._obs_dim = RL_OBS_DIM
-        self.observation_space = spaces.Box(low=-10.0, high=10.0, shape=(self._obs_dim,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-10.0, high=10.0, shape=(self.rl_obs_dim,), dtype=np.float32)
 
         self._reset_state()
 
@@ -151,8 +175,13 @@ class TradingEnvV9(gym.Env):
     # ---------- 관측 ----------
 
     @staticmethod
-    def _build_static_obs(data):
-        """파동/시장 피처 14차원을 전 행에 대해 사전 정규화 (스텝 시 행 슬라이스만 수행)"""
+    def _build_static_obs(data, exclude_features=()):
+        """파동/시장 피처를 전 행에 대해 사전 정규화 (스텝 시 행 슬라이스만 수행).
+        18개 전부 항상 계산한다 — d5/d15가 age_min을 참조하는 등 서로 의존하는 중간값이
+        있어 exclude_features에 따른 조건부 계산은 버그 위험이 크다. 최종 스택에서만
+        exclude_features(FEATURE_NAMES 기준 이름)에 없는 컬럼을 골라낸다.
+        env 인스턴스 없이도(상관분석 등) 직접 호출 가능하도록 staticmethod로 유지.
+        반환: (stacked (n, len(kept)) float32, kept 이름 리스트)"""
         n = len(data)
         close = np.maximum(data["close"].astype(np.float64), 1e-9)
         is_bull = data["is_bullish"].astype(np.float64)
@@ -199,18 +228,23 @@ class TradingEnvV9(gym.Env):
         r15 = np.clip(data["ret_15m"] * 100.0 / atr_pct_raw, -NORM["ret15_atr_clip"], NORM["ret15_atr_clip"]) / NORM["ret15_atr_clip"]
         r1h = np.clip(data["ret_1h"] * 100.0 / atr_pct_raw, -NORM["ret1h_atr_clip"], NORM["ret1h_atr_clip"]) / NORM["ret1h_atr_clip"]
 
-        return np.stack(
-            [ws, dur, div_rsi_gap, div_dist, gap, vr, vs, adx, atr_pct, bull, fib, prehit, d5, d15,
-             rsi_now_adj, r5, r15, r1h],
-            axis=1,
-        ).astype(np.float32)
+        arrays = dict(zip(FEATURE_NAMES, [
+            ws, dur, div_rsi_gap, div_dist, gap, vr, vs, adx, atr_pct, bull, fib, prehit, d5, d15,
+            rsi_now_adj, r5, r15, r1h,
+        ]))
+        unknown = set(exclude_features) - set(FEATURE_NAMES)
+        if unknown:
+            raise ValueError(f"알 수 없는 exclude_features: {sorted(unknown)} (허용: {FEATURE_NAMES})")
+        kept = [name for name in FEATURE_NAMES if name not in exclude_features]
+        stacked = np.stack([arrays[name] for name in kept], axis=1).astype(np.float32)
+        return stacked, kept
 
     def _obs(self):
         i = self._i
-        obs = np.empty(RL_OBS_DIM, dtype=np.float32)
-        obs[:OBS_DIM] = self.static_obs[i]
+        obs = np.empty(self.rl_obs_dim, dtype=np.float32)
+        obs[:self.obs_dim] = self.static_obs[i]
         if self.pos_dir == 0:
-            obs[OBS_DIM:] = 0.0
+            obs[self.obs_dim:] = 0.0
         else:
             close = self.closes[i]
             upnl = self._unrealized(close)
@@ -218,18 +252,18 @@ class TradingEnvV9(gym.Env):
             hold_min = (self.ts_ms[i] - self.entry_ts) / 60000.0
             liq_dist = self.pos_dir * (close - self.liq_price) / close * 100.0
             clipped_upnl = np.clip(upnl / MARGIN_USDT, lo_c, hi_c)
-            obs[OBS_DIM] = float(self.pos_dir)
+            obs[self.obs_dim] = float(self.pos_dir)
             # 2026-07-20: 다른 피처들(대부분 0~1/-1~1)과 스케일을 맞추기 위해 [-1,1]로 재스케일
             # (이전엔 클립 범위(-1.5~3.0) 원시값을 그대로 넣어 이 피처만 유독 큰 값 범위를 가졌음).
-            obs[OBS_DIM + 1] = float(2.0 * (clipped_upnl - lo_c) / (hi_c - lo_c) - 1.0)
-            obs[OBS_DIM + 2] = float(np.log1p(max(hold_min, 0.0)) / NORM["hold_log_max"])
+            obs[self.obs_dim + 1] = float(2.0 * (clipped_upnl - lo_c) / (hi_c - lo_c) - 1.0)
+            obs[self.obs_dim + 2] = float(np.log1p(max(hold_min, 0.0)) / NORM["hold_log_max"])
             # 2026-07-24: 하드 클립(구 liq_dist_max=10%) 제거 — leverage에 따라 진입 시점부터
             # liq_dist(~100/leverage%)가 이미 옛 상한을 넘어, 청산 근접 정보가 보유기간 대부분
             # 1.0으로 뭉개져 있었음. log1p 압축으로 교체: 위험(0 근접) 구간엔 해상도를 몰아주고
             # 안전 구간은 압축하되 정보를 완전히 버리진 않음 — 기준값은 진입 시점 값(100/leverage)
             # 이라 obs=1.0이 "진입 때만큼 안전", <1이면 그보다 위험, >1이면 그보다 안전을 의미.
             liq_dist_ref = 100.0 / self.leverage
-            obs[OBS_DIM + 3] = float(np.log1p(max(liq_dist, 0.0)) / np.log1p(liq_dist_ref))
+            obs[self.obs_dim + 3] = float(np.log1p(max(liq_dist, 0.0)) / np.log1p(liq_dist_ref))
         return obs
 
     # ---------- 포지션 회계 (rl 모드) ----------

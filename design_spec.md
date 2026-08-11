@@ -92,39 +92,41 @@ quant_real_RL/
 
 과거 `adaptive`(Box(-1,1)^6 연속, 진입 시 레버리지/손절/반익/완익까지 정책이 전부 결정하는 semi-MDP)와 `rule`(Discrete(2) Skip/Enter, 청산은 V8 엔진 고정 — Fallback B) 모드는 2026-07-30 `env.py`/`train.py`/`eval.py`에서 코드째 완전히 제거됨(`simulate_adaptive_exit`/`simulate_v8_exit`/`dynamic_leverage_ceiling` 등 전용 함수, `exit_mode` 인자 자체 포함). 아래 소절들은 현재 유효한 rl 모드 사양만 기술한다.
 
-### <span style="color: #2E8B57;">관측 공간 (18차원, `_build_static_obs`에서 전 행 사전 정규화)</span>
-| # | 피처 | 정규화 |
-|---|---|---|
-| 1 | wave_scale_percent | clip 0~12% → /12 |
-| 2 | wave_duration_day | log1p, clip 0~10일 |
-| 3 | div_rsi_gap (파동 내 RSI 극값 − 파동 끝 RSI, 방향조정 >=0) — **2026-08-03 재설계** | clip 0~30pt → /30 |
-| 4 | dist_from_div_peak_to_end (RSI 극점 → 파동 끝, 일 단위) — **2026-08-03 재설계** | log1p, `duration_log_max` 재사용 |
-| 5 | div_price_gap (RSI 극점 이후 추가 가격이동 폭) — **2026-08-03 재설계** | clip 0~3.5% → /3.5 |
-| 6 | volatility_ratio | log1p, clip 0~6 |
-| 7 | relative_volume_strength | clip 0~1 |
-| 8 | adx_5m | /100 |
-| 9 | atr/close % | clip 0~3% → /3 |
-| 10 | is_bullish | ±1 |
-| 11 | fib_pos (되돌림 위치) | clip −1~2 → /2 |
-| 12 | pre_hit_0382 | 0/1 |
-| 13–14 | fib_pos 델타 (5분 전/15분 전 대비, 파동 교체 시 0) | clip ±1 |
-| 15 | 현재 RSI (방향조정, 직전 마감 5m 캔들) — **2026-07-20 추가** | /100 |
-| 16–18 | 트레일링 수익률 5m/15m/1h (ATR% 정규화 "몇 ATR 움직임") — **2026-07-20 추가** | clip ±3/±6/±12 ATR |
+### <span style="color: #2E8B57;">관측 공간 (`FEATURE_NAMES` 전체 18종, `_build_static_obs`에서 전 행 사전 정규화, `exclude_features`로 구성 가능 — 2026-08-09 도입)</span>
+| # | `FEATURE_NAMES` | 피처 | 정규화 |
+|---|---|---|---|
+| 1 | `wave_scale` | wave_scale_percent | clip 0~12% → /12 |
+| 2 | `wave_duration` | wave_duration_day | log1p, clip 0~10일 |
+| 3 | `div_rsi_gap` | div_rsi_gap (파동 내 RSI 극값 − 파동 끝 RSI, 방향조정 >=0) — **2026-08-03 재설계** | clip 0~30pt → /30 |
+| 4 | `div_dist` | dist_from_div_peak_to_end (RSI 극점 → 파동 끝, 일 단위) — **2026-08-03 재설계** | log1p, `duration_log_max` 재사용 |
+| 5 | `div_price_gap` | div_price_gap (RSI 극점 이후 추가 가격이동 폭) — **2026-08-03 재설계** | clip 0~3.5% → /3.5 |
+| 6 | `vol_ratio` | volatility_ratio | log1p, clip 0~6 |
+| 7 | `vol_strength` | relative_volume_strength | clip 0~1 |
+| 8 | `adx` | adx_5m | /100 |
+| 9 | `atr_pct` | atr/close % | clip 0~3% → /3 |
+| 10 | `is_bullish` | is_bullish | ±1 |
+| 11 | `fib_pos` | fib_pos (되돌림 위치) | clip −1~2 → /2 |
+| 12 | `pre_hit_0382` | pre_hit_0382 | 0/1 |
+| 13–14 | `fib_delta_5m`, `fib_delta_15m` | fib_pos 델타 (5분 전/15분 전 대비, 파동 교체 시 0) | clip ±1 |
+| 15 | `rsi_now_adj` | 현재 RSI (방향조정, 직전 마감 5m 캔들) — **2026-07-20 추가** | /100 |
+| 16–18 | `ret_5m_atr`, `ret_15m_atr`, `ret_1h_atr` | 트레일링 수익률 5m/15m/1h (ATR% 정규화 "몇 ATR 움직임") — **2026-07-20 추가** | clip ±3/±6/±12 ATR |
 
-- 포지션 상태 4칸은 2026-07-19 제거 — semi-MDP는 결정 시점에 항상 무포지션이라 영원히 0인 죽은 차원이었음 ("rl" 모드는 아래 4칸을 추가한 22차원 사용).
-- wave_age_min은 wave_duration_day와 상관 0.87로 중복이라 관측에서 제외 (델타 피처의 내부 판정에만 사용).
+- 포지션 상태 4칸은 2026-07-19 제거 — semi-MDP는 결정 시점에 항상 무포지션이라 영원히 0인 죽은 차원이었음 ("rl" 모드는 아래 4칸을 추가한 기본 22차원 사용).
+- wave_age_min은 wave_duration_day와 상관 0.87로 중복이라 관측에서 제외 (델타 피처의 내부 판정에만 사용, `FEATURE_NAMES`에 애초에 없음).
+- **관측 피처 후진제거(ablation) 스크리닝 진행 중 (2026-08-09~)**: 아직 영구 제외된 피처 없음(18차원 전체가 여전히 현재 베이스라인) — 각 후보를 원 베이스라인(전체 18피처) 대비 **그 피처 하나만** 뺀 독립 실험으로 측정 중이며(누적 제외 아님, 2026-08-10 방법론 수정), 자동 채택/기각 없이 전체 후보 결과를 사용자가 직접 비교해 최종 제외 세트를 결정한다. 상세 근거·측정값은 `V10 Design TODO - 관측 피처 후진제거 (Feature Ablation).md` 참고 — 최종 결정 후 이 표에 소급 반영 예정.
+- **2026-08-09 피처 후진제거(ablation) 메커니즘 도입**: `env.py`의 `TradingEnvV9(exclude_features=(...))` — `FEATURE_NAMES`(위 표 2번째 열) 이름의 부분집합을 관측에서 제외할 수 있다. `_build_static_obs`는 상호의존(예: `fib_delta_*`가 `wave_age_min` 파생값 필요)을 피하려 18개를 항상 전부 계산한 뒤 최종 스택에서만 골라내며(`NORM`/`REQUIRED_CACHE_FIELDS`는 무관하게 그대로 유지 — 원시 캐시 스키마 검증과 관측 컬럼 선택은 독립된 관심사), `(stacked, kept_names)`를 반환한다. `train.py`/`eval.py`/`train_resume.py` 모두 `--exclude-features` CLI로 동일 값을 받고, 학습 시 체크포인트 폴더에 `{run_name}_features.json` 메타데이터를 항상 저장한다(빈 리스트 포함). `eval.py --model`은 이 메타데이터를 자동으로 읽어 학습 때와 동일한 `exclude_features`로 env를 재구성하고(`--exclude-features`로 명시 override 가능), 로드 직후 정책 기대 차원과 env 차원이 다르면 즉시 에러를 낸다 — 서로 다른 두 exclude_features가 우연히 같은 차원이 되어 "모양은 맞지만 의미가 다른" 채 조용히 오염되는 사고(2026-08-03 캐시 버전 사고와 동일 유형)를 방지하기 위함. 오프라인 상관관계 분석은 `src/ablation_corr.py`(캐시만 사용, 학습 불필요)가 담당하며 제거 후보 우선순위 큐를 산출한다. 실험 진행 로그는 `V10 Design TODO - 관측 피처 후진제거 (Feature Ablation).md` 참고 — 영구 채택된 제거만 이 표에도 반영한다.
 
-### <span style="color: #2E8B57;">rl 모드 전용 관측 4칸 (RL_OBS_DIM=22, 위 18칸 + 아래)</span>
-| # | 피처 | 정규화 | 필요성 |
+### <span style="color: #2E8B57;">rl 모드 전용 관측 4칸 (위 정적 피처 뒤에 항상 추가 — 기본 18+4=22차원, `exclude_features` 적용 시 (18−n)+4)</span>
+| # (기본값 기준) | 피처 | 정규화 | 필요성 |
 |---|---|---|---|
 | 19 | pos_dir | −1/0/+1 | 같은 행동 라벨(Hold/Enter/Close)의 실제 효과가 상태에 따라 달라져(예: 보유 중 Enter=no-op) 이 신호 없이는 판독 불가 |
 | 20 | 미실현손익/증거금 | clip(−1.5,3.0) → **[−1,1] 재스케일 (2026-07-20)** | 익절/손절 판단의 직접 근거. 이전엔 원시 클립값을 그대로 써서 다른 피처와 스케일 불일치했음 |
 | 21 | 보유시간 | log1p, /hold_log_max(30일) | rl 모드엔 강제 타임아웃이 없음 — "너무 오래 끌면 접기"를 배우는 유일한 단서 |
 | 22 | 청산가까지 거리 | `log1p(liq_dist) / log1p(100/leverage)` (2026-07-24, 하드클립 폐기) | 동적 레버리지 상한 같은 별도 안전장치가 없어, 파산 방지가 사실상 이 관측 하나에 의존 — 아래 안전 프로파일 참고. 구 `clip(0,10%)/10`은 진입 시점 값(≈100/leverage%)부터 이미 옛 상한을 넘어(leverage≤10이면 상시), 보유기간 대부분 obs=1.0으로 뭉개져 청산 근접 정보가 사실상 안 전달되고 있었음 — log 압축으로 교체해 위험(0 근접) 구간엔 해상도를 몰아주고 안전 구간은 압축하되 정보를 완전히 버리지 않음. 기준값(`100/leverage`)은 진입 시점 값이라 obs=1.0이 "진입 때만큼 안전"을 의미 |
 
-무포지션이면(19~22) 전부 0.
+무포지션이면 이 4칸 전부 0. exclude_features와 무관하게 이 4칸은 항상 포함(제거 대상 아님 — 포지션 회계에 구조적으로 필요한 상태값).
 
-> 과거 `adaptive` 모드의 Box(-1,1)^6 행동 공간(레버리지/손절/반익/완익 직접 결정, `simulate_adaptive_exit`)과 `dynamic_leverage_ceiling`(손절 거리 기반 동적 레버리지 상한, 거래당 손실 20% 캡)은 **2026-07-30 코드에서 완전히 제거**됨. rl 모드에는 이런 안전장치가 없으며, 파산 방지는 전적으로 정책이 학습한 청산가 거리 판단(위 22번 관측칸)에 의존한다.
+> 과거 `adaptive` 모드의 Box(-1,1)^6 행동 공간(레버리지/손절/반익/완익 직접 결정, `simulate_adaptive_exit`)과 `dynamic_leverage_ceiling`(손절 거리 기반 동적 레버리지 상한, 거래당 손실 20% 캡)은 **2026-07-30 코드에서 완전히 제거**됨. rl 모드에는 이런 안전장치가 없으며, 파산 방지는 전적으로 정책이 학습한 청산가 거리 판단(위 청산가 거리 관측칸)에 의존한다.
 
 ### <span style="color: #2E8B57;">시장 메커니즘 (env에는 "시장의 물리 법칙"만)</span>
 - 증거금 **100 USDT 고정** × 정책 선택 레버리지. 사이즈가 아닌 레버리지를 다이얼로 쓰는 이유: 둘 다 달러 손익 스케일엔 동일하게 작용하지만 **청산까지의 거리는 레버리지만이 결정**하기 때문.
@@ -151,7 +153,7 @@ quant_real_RL/
 ### <span style="color: #2E8B57;">신경망 및 PPO 하이퍼파라미터 (stable-baselines3)</span>
 | 항목 | 값 | 비고 |
 |---|---|---|
-| 정책망 | MlpPolicy `net_arch=[64, 64]` | 18차원 관측 + 6차원 연속 액션 (diagonal Gaussian) |
+| 정책망 | MlpPolicy `net_arch=[64, 64]` (MaskablePPO) | 기본 22차원 관측(정적 18 + 포지션 상태 4, `exclude_features` 적용 시 가변) + Discrete(3) 행동(action masking) — 옛 adaptive 모드의 "6차원 연속 액션(diagonal Gaussian)"은 2026-07-30 코드에서 완전히 제거된 오래된 표기였음(2026-08-09 수정) |
 | learning_rate | 3e-4 → 0 선형 감쇠 | |
 | n_steps / batch_size / n_epochs | 2048/워커, 512, 10 | |
 | gamma / gae_lambda | 0.999 / 0.95 | 1m 스텝 기준 유효 horizon ~16시간 |
@@ -308,23 +310,22 @@ best 선택 비교값 = 최근 --kpi-smooth-window(기본 3)회 v10_kpi의 이�
 
 - 사용법: `python src/eval.py --model models/v10_maskablerl/{run_name}/{run_name}_best.zip --split valid` (`--leverage`는 학습 때와 동일 값 지정 필수. 2026-08-03 이전 산출물은 `models/v9_maskablerl/`)
 
-### <span style="color: #2E8B57;">rl 모드 성능 베이스라인 (2026-08-03 갱신)</span>
-`models/v10_maskablerl/v10_maskablerl_seed0_0803-0053_best.zip` (40M/100M 스텝, 캐시 v9bx — RSI-다이버전스 버그 2종만 수정)을 이후 rl 모드 실험들의 비교 기준으로 삼는다(사용자 지정, 2026-08-03). **구 베이스라인(0728-1924, v9_kpi +1.6665)은 폐기** — RSI-다이버전스 결함(가격/RSI 짝 불일치 + 피봇 admission 룩어헤드, `RSI-div-개편이전-핵심결함.md`) 때문에 비정상적으로 부풀려진 수치였던 것으로 확인됨. 사본을 `models/best/`에 보관(구 `v9_maskablerl_seed0_0728-1924_best.zip`은 과거 기록으로 그대로 둠).
+### <span style="color: #2E8B57;">rl 모드 성능 베이스라인 (2026-08-09 갱신 — v10 캐시 최초 유효 베이스라인)</span>
+`models/v10_maskablerl/v10_maskablerl_seed0_0809-1906/v10_maskablerl_seed0_0809-1906_best.zip` (63.5M/100M 스텝, 캐시 **v10**, `exclude_features=[]` 전체 18피처)을 이후 rl 모드 실험(특히 관측 피처 후진제거)들의 비교 기준으로 삼는다. **구 베이스라인(0803-0053, v9_kpi +1.0345)은 폐기** — 캐시 `v9bx`로 학습돼 현재 `v10` 캐시(2026-08-05 5분봉 데이터 완전 제거로 피봇 SET 자체가 달라짐)와 관측값이 달라 직접 비교 불가, 게다가 `v10_kpi`(2026-08-06 도입) 이전 산출물이라 선택 기준도 다름. 동일 설정(exclude_features=[])의 seed1 재현 결과(`v10_maskablerl_seed1_0809-1910_best.zip`, BTC valid v10_kpi +2.2152)와의 편차로 **TOLERANCE=1.2728**을 산출해 향후 피처 제거 실험의 채택 기준으로 사용(상세: `V10 Design TODO - 관측 피처 후진제거 (Feature Ablation).md`).
 
 | | BTC valid | ETH valid |
 |---|---|---|
-| trades | 178 | 404 |
-| win_rate | 60.1% | 58.2% |
-| total_pnl | +40.8 | -50.4 |
-| MSL | -5.2 | -33.2 |
-| top1_share | 9.7% | inf(음수 거래 없음) |
-| compound_mdd_pct | 14.2% | 65.5% |
-| geo_mean_per_trade | +0.2193% | -0.1821% |
-| sel_monthly_log | -0.0289 | -0.2362 |
-| **v9_kpi** (선택 점수) | **+1.0345** | -0.2840 |
-| 합격기준 ①②③ / MDD 게이트 | 전부 통과 | 통과(②③ 탈락, 게이트만 통과) |
+| trades | 120 | 295 |
+| win_rate | 75.0% | 63.4% |
+| total_pnl | +93.3 | -49.9 |
+| MSL | -10.1 | -50.0 |
+| top1_share | 8.2% | inf(총손익≤0) |
+| compound_mdd_pct | 17.3% | 74.9% |
+| geo_mean_per_trade | +0.7500% | -0.3149% |
+| **v10_kpi** (선택 점수) | **+3.488** | -0.9371 |
+| 합격기준 ①②③ / 하드게이트 | 전부 통과 | ①만 통과(②③ 탈락), 하드게이트도 탈락(MDD 74.9%≥70%) |
 
-test 평가는 아직 미실시(개발 진행 중이라 V9 Design.md 8장 원칙에 따라 보류). ~~참고 비교용 다음 세대 후보 — `v10_maskablerl_seed0_0803-0145_best.zip`(67M/100M, 캐시 v9c)~~ **이 런은 v9c의 `div_end_idx` 룩백 버그(아래 이력 참고, 78% 행 오염)가 있던 버전으로 학습된 것이라 무효 처리 — 수치 폐기, 버그 수정된 v9c로 재학습 필요.**
+test 평가는 아직 미실시(개발 진행 중이라 V9 Design.md 8장 원칙에 따라 보류).
 
 **🚨 2026-08-03 평가 사고 기록**: 위 0803-0053 재평가를 처음 `eval.py`로 돌렸을 때 v9_kpi가 학습 중 기록값(+1.0345)과 전혀 다른 -0.7453으로 나온 사고가 있었음 — 원인은 `eval.py`의 `cache_path_for()`가 심볼명만 받고 캐시 버전을 하드코딩하는 구조라, `CACHE_VER`를 v9bx→v9c로 올리는 순간 v9bx로 학습된 구 체크포인트도 무조건 v9c 캐시로 평가하게 됐던 것. 관측 차원이 우연히 같아서(22차원 그대로) 에러 없이 로드되고 필드 의미만 완전히 달라진 캐시를 조용히 먹인 셈 — 두 코드 버전을 재구성해 v9bx 캐시로 재평가하니 +1.0345로 정확히 재현되어 원인 확정. 재발 방지: ① `eval.py`에 `--cache-ver` 옵션 추가(`evaluate()`/`cache_path_for()`가 `cache_ver` 인자 지원, 미지정 시 최신 `eval.CACHE_VER`) — 구 스키마 체크포인트 재평가 시 명시적으로 버전 지정 가능. ② `env.py`에 `REQUIRED_CACHE_FIELDS` 스키마 검증 가드 추가 — `TradingEnvV9.__init__`이 캐시 로드 직후 필요 필드 존재를 확인해, 스키마가 다르면(차원이 같아도) 즉시 `ValueError`로 실패하도록 변경 — 이전처럼 조용히 잘못된 값으로 진행되는 경로를 원천 차단.
 
@@ -413,6 +414,11 @@ test 평가는 아직 미실시(개발 진행 중이라 V9 Design.md 8장 원칙
 | 08-06 | **best 후보 자격에 가드4(`worst_equity >= 60`) 추가** | 사용자 지시. `compound_mdd_pct`(가드3)는 전체 검증 구간을 하나의 통짜 복리로 보는 지표라 "가장 나쁜 한 달"만 따로 못 잡는 반면, `worst_equity`(2026-08-04 도입된 참고 지표 — 월별 100 USDT 리셋 복리 중 최악의 월말 잔고)는 그 최악의 달 하나를 직접 겨냥 — v10_kpi(거래단위 t-통계량, 경로 무관)도 가드3(전체 통짜 MDD)도 못 걸러내는 "특정 한 달에 계좌가 크게 깎이는" 실패 모드를 보강. `eval.py`에 `MIN_WORST_EQUITY = 60.0` 신설, `evaluate()` 리포트의 게이트 출력에 반영. `train.py`의 `ValidationCallback.btc_eligible` 조건에 `m["worst_equity"] >= MIN_WORST_EQUITY` 추가(기존 가드1~3과 AND). `worst_equity`는 이미 2026-08-04부터 `compute_metrics()`가 산출하고 TB에 기록 중이던 지표라 신규 계산 로직 없이 게이트 조건만 추가. 세 파일 import 스모크 통과. |
 | 08-06 | **`explore_bonus_decay_frac`×`explore_bonus_start` 조합 실험 4개(0805-2141/2152, 0806-0019/0037)를 v10_kpi+가드1~4로 소급 재평가 — best 재선정** | 사용자 지시로 위 두 항목(v10_kpi 도입·가드4 추가) 적용 후 진행. TB에는 거래별 원시 pnl이 없어(스칼라만 기록) 우선 `total_pnl/(pnl_std·√n)`(로그수익률 대신 원시 pnl 기반 t-통계량 근사 — 스케일 불변이라 소규모 수익률에선 거의 동일)로 전 검증 스텝(런당 200회)에 걸쳐 `ValidationCallback`과 동일한 3회 이동평균+가드 로직을 시뮬레이션해 후보 스텝을 1차 추림. **이 근사값을 신뢰하지 않고**, 각 런에서 후보 스텝에 가장 가까운 실제 저장 체크포인트(~1M 스텝 간격)를 골라 `eval.py --leverage 3.0`으로 **직접 재롤아웃**해 정확한 v10_kpi를 확정. 🚨 **1차 시도에서 `--leverage` 미지정으로 돌렸다가 env.py 기본값(20.0)이 적용돼 total_pnl 8배·표준편차 10배 부풀려지고 전 종목 파산(compound MDD 100%)으로 나오는 사고 발생** — `train.py` 기본 leverage(3.0)와 `env.py` 생성자 기본값(20.0)이 다르다는 걸 놓친 것이 원인. TB에 기록된 학습 중 실측치와 대조해 즉시 발견, `--leverage 3.0`으로 재실행해 TB 값과 합치하는 결과로 정정(교훈: 학습 스크립트와 평가 스크립트의 기본값이 다른 하이퍼파라미터는 항상 명시 지정할 것). **재선정 결과**: 4개 런 모두 새 best가 최종 체크포인트가 아니라 **학습 초반~중반**(전체 100M 중 16~33M 지점)에서 나옴 — ①decay0.75/start0.0005(2141): 23.0M, v10_kpi +1.91, MDD 21.9%. ②decay0.75/start0.001(2152): 33.0M, v10_kpi +0.57(최저), MDD 31.9%. ③decay0.75/start0.0001(0019): **16.0M, v10_kpi +2.53(최고)**, MDD 20.1%, 승률 78.3%. ④decay0.9/start0.0005(0037): 23.0M, v10_kpi +2.45, MDD 13.2%(최저 MDD). 4개 전부 가드1~4 통과. **해석**: 기존(v9_kpi 시절) 분석에서 ③(start=0.0001)은 "학습 후반 ETH 파산 + BTC 거래 1건 아티팩트"로 최악으로 판정됐었는데, 그건 **학습 후반부만** 본 결과였고 v10_kpi로 전 구간을 다시 훑으니 **학습 초반(16M) 구간은 오히려 4개 런 중 최고 품질**이었음이 드러남 — "최종 체크포인트가 곧 최선"이라는 가정이 틀렸던 사례. 산출물: 각 런 디렉토리에 기존 `_best.zip`(v9_kpi 기준, 보존)과 별도로 `_best_v10.zip`+`_best_v10_info.json` 신규 생성(비파괴적 — 기존 파일 덮어쓰지 않음). |
 | 08-06 | **`leverage` 기본값을 `env.py`/`eval.py` 전체에서 3.0으로 통일 (`train.py`는 이미 3.0)** | 바로 위 소급 재평가 작업 중 겪은 사고(1차 시도에서 `--leverage` 미지정 → `env.py` 구 기본값 20.0 적용 → 전 종목 거짓 파산)의 재발을 원천 차단하기 위해 사용자 지시로 진행. 기존엔 `train.py`만 CLI 기본값 3.0을 갖고 있었고, `env.py`의 `TradingEnvV9` 생성자 자체 기본값은 20.0, `eval.py`의 CLI/`evaluate()`/`run_policy_on_range(s)` 기본값은 전부 `None`(미지정 시 `env.py` 기본값으로 조용히 폴백)이라 세 곳의 실질 기본값이 서로 달랐던 것이 근본 원인. 수정: `env.py` `TradingEnvV9.__init__`의 `leverage=20.0` → `leverage=3.0`(진짜 소스), `eval.py`의 `run_policy_on_ranges`/`run_policy_on_range`/`evaluate()` 함수 기본값과 `--leverage` CLI 기본값을 전부 `None` → `3.0`으로 변경(코드에서 명시적으로 보이도록 — `--help` 텍스트에도 통일 배경 기록). `train.py`는 이미 3.0이라 변경 없음. 세 파일 import/`--help` 스모크 통과. |
+| 08-09 | **관측 피처 후진제거(ablation) 메커니즘 도입 + v10 캐시 최초 유효 베이스라인 확보** | 성능에 영향 없는 관측 피처를 하나씩 찾아 제거하는 탐욕적 후진제거 작업 착수. `env.py`에 `FEATURE_NAMES`(18개 정적 피처 공용 이름)와 `TradingEnvV9(exclude_features=...)` 신설(`_build_static_obs`는 상호의존 방지를 위해 18개를 항상 전부 계산한 뒤 이름 기준으로 선택), `train.py`/`eval.py`/`train_resume.py`에 `--exclude-features` CLI 및 `{run_name}_features.json` 메타데이터 사이드카 추가(체크포인트-환경 불일치를 로드 직후 방어적 assert로 차단 — 2026-08-03 캐시 버전 사고와 동일한 실패 유형 방지). `src/ablation_corr.py` 신설(캐시만으로 18피처 쌍별 상관관계 계산, 학습 불필요) — BTC/ETH 교차확인 결과 `wave_age_min`(0.87, 기존 제외 전례) 수준의 명백한 중복은 없었고, `pre_hit_0382`/`fib_pos`(0.648)가 최상위. **실행 중 발견**: 기존 베이스라인(0803-0053)과 그 이후 v10 캐시 학습분(0805-*)이 각각 캐시 버전 불일치·저장공간 정리(같은 날 커밋 `260809 - 저장불필요한 실험데이터 제거`)로 사용 불가 판명 — `exclude_features=[]`(전체 18피처)로 seed0/seed1 두 번 재학습(100M×2, 4코어 중 2코어를 각각 `--main-core 0`/`--main-core 1`로 병렬 사용)해 새 베이스라인(`v10_maskablerl_seed0_0809-1906`, BTC valid v10_kpi +3.488) 확보, seed1과의 편차로 TOLERANCE=1.2728 산출(위 절 참고). 상세 시도 로그는 `V10 Design TODO - 관측 피처 후진제거 (Feature Ablation).md`에 별도 관리(기각 후보 포함, 영구 채택된 것만 이 문서에 소급 반영 예정). 우선 테스트 큐는 사용자 도메인 판단으로 다이버전스 3종/`wave_scale`/`is_bullish`를 제외하고 상관계수 내림차순 9개로 확정(`pre_hit_0382`→`ret_5m_atr`→`ret_1h_atr`→`fib_delta_15m`→`fib_delta_5m`→`atr_pct`→`adx`→`vol_strength`→`vol_ratio`), 사용자 승인으로 매 후보 재확인 없이 자동 순차 진행 중. |
+| 08-10 | **피처 후진제거 candidate 1 채택: `pre_hit_0382` 제거 (18→17차원)** | `exclude_features=[pre_hit_0382]`로 seed0/seed1 100M×2 병렬 학습 후 BTC valid 평가 — seed0 v10_kpi +2.2323, seed1 +2.4077 (임계값 베이스라인−TOLERANCE = 3.488−1.2728 = 2.2152, 둘 다 통과), acceptance 3/3·MDD(17.6%/21.6%)·worst_equity(90.7/94.1) 전부 게이트 통과. 두 시드 모두 통과해 영구 채택 — 새 베이스라인은 `v10_maskablerl_seed0_0809-2142_best.zip`(92.5M/100M), 참조 v10_kpi는 +2.2323으로 갱신(다음 후보 게이트 기준점). candidate 2(`ret_5m_atr`)로 자동 진행. |
+| 08-10 | **피처 후진제거 candidate 2 채택: `ret_5m_atr` 제거 (17→16차원)** | `exclude_features=[pre_hit_0382, ret_5m_atr]`로 seed0/seed1 100M×2 병렬 학습 후 BTC valid 평가 — seed0 v10_kpi +1.4275, seed1 +2.3442 (임계값 2.2323−1.2728 = 0.9595, 둘 다 통과), acceptance 3/3·MDD(26.5%/17.5%)·worst_equity(85.0/93.7) 전부 게이트 통과. 영구 채택 — 새 베이스라인 `v10_maskablerl_seed0_0810-0011_best.zip`(61.5M/100M), 참조 v10_kpi +1.4275로 갱신. candidate 3(`ret_1h_atr`)로 자동 진행. |
+| 08-10 | **피처 후진제거 candidate 3 채택(단, 채택 기준 결함 발견으로 다음 후보 보류): `ret_1h_atr` 제거 (16→15차원)** | `exclude_features=[pre_hit_0382, ret_5m_atr, ret_1h_atr]`로 seed0/seed1 100M×2 병렬 학습 후 BTC valid 평가 — seed0 v10_kpi +1.2492, seed1 +1.6281 (임계값 1.4275−1.2728 = 0.1547, 둘 다 통과), acceptance 3/3·MDD(25.5%/20.0%)·worst_equity(82.2/92.5) 전부 게이트 통과. 규칙상 영구 채택 — 새 베이스라인 `v10_maskablerl_seed0_0810-0237_best.zip`(64.5M/100M), 참조 v10_kpi +1.2492로 갱신. **⚠️ 다음 후보(4번) 임계값이 1.2492−1.2728=−0.0236으로 음수가 됨** — TOLERANCE(1.2728, 최초 18피처 베이스라인 시드 편차로 1회 산출)를 매번 "직전 채택 후보의 seed0 값"에 고정폭으로 재적용하는 방식이라, v10_kpi가 3.488→2.23→1.43→1.25로 단조 감소하는 추세를 게이트가 못 잡음(TOLERANCE 자체가 매 비교폭보다 훨씬 큼). 채택 기준 재설계 전까지 candidate 4 착수 보류, 사용자 확인 대기. |
+| 08-10 | **피처 후진제거 방법론 전면 수정 — 누적 제거 폐기, 개별 독립 테스트 + 자동채택 폐지** | 사용자 지적: candidate 2·3(`ret_5m_atr`/`ret_1h_atr`)을 직전 후보들과 **누적**해서 뺀 채로 테스트한 게 애초에 잘못 — "이 피처 하나가 성능에 영향을 주는가"가 아니라 "누적 제외 상태가 영향을 주는가"를 측정한 셈이었고, 그 결과 게이트 임계값도 매번 미끄러져 결국 무의미(음수)해짐(바로 위 항목). 수정: ① 이후 모든 후보는 **원 베이스라인(18피처 전체) 대비 그 피처 하나만** 제외한 독립 실험(비누적) — `pre_hit_0382`(candidate 1)는 애초에 단독 테스트였으므로 측정값 그대로 유효. `ret_5m_atr`/`ret_1h_atr`는 재실험 필요(기존 누적 실험 결과는 무효 처리, 체크포인트는 보존하되 비교에 미사용). ② **자동 채택/기각 로직(TOLERANCE 게이트) 폐지** — 각 후보는 측정만 하고(v10_kpi/acceptance/MDD/worst_equity 등 전체 지표), 최종 제외 세트는 9개 후보 전부 측정 완료 후 사용자가 결과를 직접 비교해 결정. `design_spec.md` §3 관측 표는 원상복구(18차원 전체, 아직 영구 제외 없음) — 최종 결정 후 한 번에 반영 예정. 상세는 `V10 Design TODO...md` 참고. |
 
 ---
 

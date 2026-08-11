@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
-from env import TradingEnvV9, MARGIN_USDT  # noqa: E402
+from env import TradingEnvV9, MARGIN_USDT, FEATURE_NAMES  # noqa: E402
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 CACHE_DIR = os.path.join(ROOT_DIR, "caches")
@@ -63,6 +63,21 @@ CACHE_VER = "v10"   # prep_features.CACHE_VER와 반드시 동기화할 것 (202
 def cache_path_for(symbol, suffix="", cache_ver=None):
     cache_ver = cache_ver or CACHE_VER
     return os.path.join(CACHE_DIR, f"features_{cache_ver}_{symbol}{suffix}.npy")
+
+
+def load_feature_metadata(model_path):
+    """{run_name}_features.json 사이드카를 --model 경로 옆 폴더에서 찾는다 (2026-08-09
+    피처 후진제거 메커니즘 도입). 없으면 None — 호출부가 구 체크포인트로 간주해
+    전체 FEATURE_NAMES(exclude_features=[])로 기본 처리해야 한다."""
+    import glob
+    model_dir = os.path.dirname(os.path.abspath(model_path))
+    cands = glob.glob(os.path.join(model_dir, "*_features.json"))
+    if not cands:
+        return None
+    if len(cands) > 1:
+        raise ValueError(f"모델 폴더에 *_features.json이 여러 개 있어 특정할 수 없음: {cands}")
+    with open(cands[0], encoding="utf-8") as f:
+        return json.load(f)
 
 
 def split_bounds(cache_paths, final=False):
@@ -159,7 +174,8 @@ def numpy_policy_if_supported(model):
 
 
 def run_policy_on_ranges(model, targets, n_segments=1, decision_stride=1, fee_rate=0.0005,
-                         max_hold_bars=None, leverage=3.0, use_numpy_policy=True):
+                         max_hold_bars=None, leverage=3.0, use_numpy_policy=True,
+                         exclude_features=None):
     """여러 독립 레인(심볼)을 한 배치로 동시 롤아웃. targets: [(key, cache_path, lo, hi), ...]
     → {key: trades}
 
@@ -178,7 +194,8 @@ def run_policy_on_ranges(model, targets, n_segments=1, decision_stride=1, fee_ra
     """
     env_kwargs = {"decision_stride": decision_stride, "fee_rate": fee_rate,
                   "fixed_full_range": True}
-    for key, val in (("max_hold_bars", max_hold_bars), ("leverage", leverage)):
+    for key, val in (("max_hold_bars", max_hold_bars), ("leverage", leverage),
+                     ("exclude_features", exclude_features)):
         if val is not None:
             env_kwargs[key] = val
 
@@ -228,7 +245,8 @@ def run_policy_on_ranges(model, targets, n_segments=1, decision_stride=1, fee_ra
 
 
 def run_policy_on_range(model, cache_path, lo, hi, n_segments=1, decision_stride=1, fee_rate=0.0005,
-                        max_hold_bars=None, leverage=3.0, use_numpy_policy=True):
+                        max_hold_bars=None, leverage=3.0, use_numpy_policy=True,
+                        exclude_features=None):
     """단일 구간 롤아웃 — `run_policy_on_ranges`(복수형)의 1개 타깃 래퍼(기존 시그니처 유지).
 
     기본 n_segments=1 = 세그먼트 분할 없음 (2026-07-19: 16분할 병렬은 경계 강제정산 + 재수렴
@@ -239,6 +257,7 @@ def run_policy_on_range(model, cache_path, lo, hi, n_segments=1, decision_stride
         model, [(0, cache_path, lo, hi)], n_segments=n_segments,
         decision_stride=decision_stride, fee_rate=fee_rate,
         max_hold_bars=max_hold_bars, leverage=leverage, use_numpy_policy=use_numpy_policy,
+        exclude_features=exclude_features,
     )[0]
 
 
@@ -497,9 +516,10 @@ def fmt_compound(cm):
     )
 
 
-def evaluate(model, symbols, split, fee_rate=0.0005, decision_stride=1,
+def evaluate(model, symbols, split, fee_rate=0.0007, decision_stride=1,
              n_segments=1, cache_suffix="", verbose=True,
-             max_hold_bars=None, leverage=3.0, final_split=False, cache_ver=None):
+             max_hold_bars=None, leverage=3.0, final_split=False, cache_ver=None,
+             exclude_features=None):
     paths = {s: cache_path_for(s, cache_suffix, cache_ver=cache_ver) for s in symbols}
     bounds = split_bounds(list(paths.values()), final=final_split)
     report = {"split": split, "fee_rate": fee_rate, "symbols": {}}
@@ -514,7 +534,8 @@ def evaluate(model, symbols, split, fee_rate=0.0005, decision_stride=1,
         targets.append((sym, path, lo, hi))
     trades_by_sym = run_policy_on_ranges(model, targets, n_segments=n_segments,
                                          decision_stride=decision_stride, fee_rate=fee_rate,
-                                         max_hold_bars=max_hold_bars, leverage=leverage)
+                                         max_hold_bars=max_hold_bars, leverage=leverage,
+                                         exclude_features=exclude_features)
     for sym, path, lo, hi in targets:
         ts = np.load(path)["ts_1m"]
         trades = trades_by_sym[sym]
@@ -579,12 +600,43 @@ def main():
     parser.add_argument("--out", default=None, help="리포트 JSON 저장 경로")
     parser.add_argument("--final-split", action="store_true",
                         help="배포 전 최종학습용 95/5(train/valid) 분할 기준으로 평가 (test 없음, 2026-07-23)")
+    parser.add_argument("--exclude-features", nargs="*", default=None,
+                        help="관측에서 제외할 피처 이름(공백 구분, env.FEATURE_NAMES 중). "
+                             "미지정 시 --model 옆 *_features.json 메타데이터에서 자동 로드 — "
+                             "그마저 없으면 전체 18피처(구 체크포인트) 기본값. 명시하면 "
+                             "메타데이터보다 우선하며 불일치 시 경고를 출력한다.")
     args = parser.parse_args()
 
     # 2026-07-27: action masking 도입으로 MaskablePPO 저장 포맷으로 전환됨 —
     # 기존(masking 이전) 체크포인트는 정책 클래스가 달라 호환 안 됨(재학습 필요).
     from sb3_contrib import MaskablePPO
     model = MaskablePPO.load(args.model, device="cpu")
+
+    # 2026-08-09: 피처 후진제거(ablation) 메타데이터 정합성 — 체크포인트가 학습된
+    # exclude_features와 다른 값으로 평가하면 관측 차원은 같아도(예: 서로 다른 피처 하나씩
+    # 제외한 두 실험이 우연히 같은 17차원) 컬럼 의미가 어긋난 채 조용히 실행된다
+    # (2026-08-03 캐시 버전 사고와 동일한 실패 유형). 이름 목록 메타데이터 + 아래 방어적
+    # 차원 검사로 차단.
+    meta = load_feature_metadata(args.model)
+    if args.exclude_features is not None:
+        if meta and sorted(args.exclude_features) != meta["exclude_features"]:
+            print(f"⚠️  --exclude-features가 메타데이터와 다름: "
+                  f"{meta['exclude_features']} -> {sorted(args.exclude_features)}")
+        exclude_features = args.exclude_features
+    elif meta is not None:
+        exclude_features = meta["exclude_features"]
+    else:
+        print(f"[metadata] {args.model} 옆에 *_features.json 없음 — 구 체크포인트로 간주, 전체 18피처 사용")
+        exclude_features = []
+
+    policy_dim = model.policy.observation_space.shape[0]
+    env_dim = len(FEATURE_NAMES) - len(set(exclude_features)) + 4
+    if policy_dim != env_dim:
+        raise ValueError(
+            f"체크포인트 기대 관측차원={policy_dim}이지만 exclude_features={exclude_features} "
+            f"적용 시 {env_dim}차원 — 메타데이터/CLI 불일치. 모양이 우연히 맞아 조용히 오염된 "
+            f"평가가 되는 것을 방지하기 위해 즉시 중단."
+        )
 
     if args.split == "test":
         if args.final_split:
@@ -594,7 +646,8 @@ def main():
     report = evaluate(model, args.symbols, args.split, fee_rate=args.fee,
                       decision_stride=args.stride, n_segments=args.segments,
                       cache_suffix=args.cache_suffix, leverage=args.leverage,
-                      final_split=args.final_split, cache_ver=args.cache_ver)
+                      final_split=args.final_split, cache_ver=args.cache_ver,
+                      exclude_features=exclude_features)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2, ensure_ascii=False, default=str)
